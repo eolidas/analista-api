@@ -71,8 +71,11 @@ def atualizar_token_strava(refresh_token: str) -> str:
         return res.json().get('access_token')
     raise HTTPException(status_code=401, detail="Falha ao renovar token do Strava")
 
-def baixar_novos_treinos(access_token: str, after_timestamp: int = None, incluir_caminhadas: bool = True):
-    """Sincronização com Strava: Aplica filtro rígido de tipos permitidos."""
+def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
+    """
+    Sincronização Unificada: Extrai sempre Corridas e Caminhadas.
+    A filtragem de exibição ocorrerá nativamente no Frontend (Client-side).
+    """
     url = 'https://www.strava.com/api/v3/athlete/activities'
     headers = {'Authorization': f'Bearer {access_token}'}
     
@@ -100,30 +103,30 @@ def baixar_novos_treinos(access_token: str, after_timestamp: int = None, incluir
     df_bruto = pd.DataFrame(atividades_totais)
     if 'type' not in df_bruto.columns: return []
         
-    # FILTRO MESTRE: Só passa os tipos permitidos
-    tipos_permitidos = ['Run', 'Walk'] if incluir_caminhadas else ['Run']
-    df_corridas = df_bruto[df_bruto['type'].isin(tipos_permitidos)].copy()
+    # FILTRO MESTRE: Coleta tanto as Corridas quanto as Caminhadas
+    df_atividades = df_bruto[df_bruto['type'].isin(['Run', 'Walk'])].copy()
     
-    if df_corridas.empty: return []
+    if df_atividades.empty: return []
         
-    df_corridas['distancia_km'] = df_corridas['distance'] / 1000.0
+    df_atividades['distancia_km'] = df_atividades['distance'] / 1000.0
     
     def formatar_pace(linha):
         if linha['distancia_km'] == 0: return "00:00"
         pace_dec = (linha['moving_time'] / 60) / linha['distancia_km']
         return f"{int(pace_dec):02d}:{int(round((pace_dec - int(pace_dec)) * 60)):02d}"
         
-    df_corridas['Pace_Medio'] = df_corridas.apply(formatar_pace, axis=1)
-    df_corridas['Cadence_SPM'] = df_corridas['average_cadence'] * 2 if 'average_cadence' in df_corridas.columns else 0
-    df_corridas['average_heartrate'] = df_corridas['average_heartrate'].fillna(0) if 'average_heartrate' in df_corridas.columns else 0
-    df_corridas['total_elevation_gain'] = df_corridas['total_elevation_gain'] if 'total_elevation_gain' in df_corridas.columns else 0
+    df_atividades['Pace_Medio'] = df_atividades.apply(formatar_pace, axis=1)
+    df_atividades['Cadence_SPM'] = df_atividades['average_cadence'] * 2 if 'average_cadence' in df_atividades.columns else 0
+    df_atividades['average_heartrate'] = df_atividades['average_heartrate'].fillna(0) if 'average_heartrate' in df_atividades.columns else 0
+    df_atividades['total_elevation_gain'] = df_atividades['total_elevation_gain'] if 'total_elevation_gain' in df_atividades.columns else 0
         
-    df_corridas['start_date_local'] = pd.to_datetime(df_corridas['start_date_local'])
-    df_corridas = df_corridas.sort_values(by='start_date_local', ascending=False).reset_index(drop=True)
+    df_atividades['start_date_local'] = pd.to_datetime(df_atividades['start_date_local'])
+    df_atividades = df_atividades.sort_values(by='start_date_local', ascending=False).reset_index(drop=True)
 
-    colunas = ['name', 'distancia_km', 'Pace_Medio', 'Cadence_SPM', 'average_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local']
+    # NOVO: Adicionado a coluna 'type' para o Frontend saber o que é Run e Walk
+    colunas = ['type', 'name', 'distancia_km', 'Pace_Medio', 'Cadence_SPM', 'average_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local']
     
-    json_string = df_corridas[colunas].to_json(orient='records', force_ascii=False, date_format='iso')
+    json_string = df_atividades[colunas].to_json(orient='records', force_ascii=False, date_format='iso')
     return json.loads(json_string)
 
 def calcular_estatisticas(historico: list) -> dict:
@@ -239,8 +242,8 @@ def obter_dados_atleta(strava_id: int):
     }
 
 @app.post("/atleta/{strava_id}/sincronizar")
-def sincronizar_treinos(strava_id: int, caminhadas: bool = True, force_full: bool = False):
-    """O LIMPPA-TRILHOS: Se 'force_full' for verdadeiro, ignora data e puxa tudo de novo aplicando os novos filtros."""
+def sincronizar_treinos(strava_id: int):
+    """SINCRONIZAÇÃO INTELIGENTE (LIMPA E DIRETA). O Backend ignora parametros antigos (caminhadas, force_full) da URL."""
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
@@ -263,26 +266,20 @@ def sincronizar_treinos(strava_id: int, caminhadas: bool = True, force_full: boo
         res_full = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
         perfil_final = res_full.data[0]
 
-    # 2. Sync de Treinos
+    # 2. Sync de Treinos (Apenas Delta Clássico)
     historico_antigo = atleta_db.get('historico_json') or []
+    after_timestamp = None
     
-    if force_full:
-        # Modo Trator: Puxa do Big Bang aplicando a regra nova e descarta o lixo local
-        after_timestamp = None
-        treinos_novos = baixar_novos_treinos(access_token, after_timestamp, incluir_caminhadas=caminhadas)
-        todos_treinos = treinos_novos
-    else:
-        # Modo Delta: Puxa apenas o que faltava
-        after_timestamp = None
-        if historico_antigo:
-            data_str = historico_antigo[0].get("start_date_local")
-            if data_str:
-                dt = datetime.fromisoformat(data_str.replace("Z", "+00:00")[:19])
-                after_timestamp = int(dt.timestamp()) + 1 
-        treinos_novos = baixar_novos_treinos(access_token, after_timestamp, incluir_caminhadas=caminhadas)
-        todos_treinos = treinos_novos + historico_antigo if treinos_novos else historico_antigo
+    if historico_antigo:
+        data_str = historico_antigo[0].get("start_date_local")
+        if data_str:
+            dt = datetime.fromisoformat(data_str.replace("Z", "+00:00")[:19])
+            after_timestamp = int(dt.timestamp()) + 1 
+            
+    treinos_novos = baixar_novos_treinos(access_token, after_timestamp)
+    todos_treinos = treinos_novos + historico_antigo if treinos_novos else historico_antigo
 
-    # 3. Deduplicação Definitiva
+    # 3. Deduplicação
     treinos_unicos = {}
     for t in todos_treinos:
         data_chave = t.get('start_date_local')
@@ -291,7 +288,7 @@ def sincronizar_treinos(strava_id: int, caminhadas: bool = True, force_full: boo
             
     historico_atualizado = sorted(list(treinos_unicos.values()), key=lambda x: x.get('start_date_local', ''), reverse=True)
     
-    if treinos_novos or force_full or len(historico_atualizado) != len(historico_antigo):
+    if treinos_novos or len(historico_atualizado) != len(historico_antigo):
         supabase.table("usuarios_strava").update({"historico_json": historico_atualizado}).eq("id", strava_id).execute()
         
     return {
@@ -305,8 +302,8 @@ def sincronizar_treinos(strava_id: int, caminhadas: bool = True, force_full: boo
 @app.post("/ia/analise")
 def gerar_analise_ia(requisicao: IAAnaliseRequest):
     """
-    Motor Blindado: Remove formatação de código (Markdown) do Gemini antes do JSON Parser, 
-    e trata corretamente o limite de dados (Fallback caso o mês não tenha treinos).
+    Motor Blindado: A IA analisa EXCLUSIVAMENTE corridas ('Run') para garantir
+    que diagnósticos biomecânicos e cardíacos não sejam contaminados por passeios.
     """
     res_db = supabase.table("usuarios_strava").select("*").eq("id", requisicao.strava_id).execute()
     usuario = res_db.data[0]
@@ -314,14 +311,18 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
     
     if not historico: raise HTTPException(status_code=400, detail="Sem treinos para analisar.")
 
+    # BLINDAGEM IA: Filtramos apenas atividades que sejam corridas (padrão assumido se antigo)
+    historico_corridas = [t for t in historico if t.get('type', 'Run') == 'Run']
+    if not historico_corridas: raise HTTPException(status_code=400, detail="Sem corridas cadastradas para análise IA.")
+
     idade = usuario.get('idade') or "Não informada"
     peso = usuario.get('peso') or "Não informado"
     genero = usuario.get('genero') or "Não informado"
     altura_txt = f"{usuario.get('altura')}cm" if usuario.get('altura') else "Não informada"
 
     vol_total = 0
-    for t in historico: vol_total += t.get('distancia_km', 0)
-    treinos_total = len(historico)
+    for t in historico_corridas: vol_total += t.get('distancia_km', 0)
+    treinos_total = len(historico_corridas)
     
     vol_30d = 0
     bpm_soma = 0
@@ -329,7 +330,7 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
     treinos_30_dias_brutos = []
     limite_30d = datetime.now() - timedelta(days=30)
     
-    for t in historico:
+    for t in historico_corridas:
         data_str = t.get("start_date_local")
         if data_str:
             dt = datetime.fromisoformat(data_str.replace("Z", "+00:00")[:19])
@@ -343,7 +344,7 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
 
     # PROTEÇÃO: Se o corredor não treinou este mês, envia as últimas 3 de sempre
     if not treinos_30_dias_brutos:
-        treinos_30_dias_brutos = historico[:3]
+        treinos_30_dias_brutos = historico_corridas[:3]
 
     payload_para_ia = json.dumps(treinos_30_dias_brutos, ensure_ascii=False)
     
@@ -358,14 +359,14 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
     - Peso: {peso}kg
     - Altura: {altura_txt}
     
-    📊 CARGA CRÔNICA (VISÃO MACRO - Experiência do Atleta):
-    - Total de Treinos Registrados: {treinos_total}
-    - Distância Total Acumulada: {round(vol_total, 1)} km
+    📊 CARGA CRÔNICA DE CORRIDA (VISÃO MACRO - Experiência do Atleta):
+    - Total de Corridas Registradas: {treinos_total}
+    - Distância Total Acumulada em Corrida: {round(vol_total, 1)} km
     
     📈 CARGA AGUDA E BIOMECÂNICA (VISÃO DOS ÚLTIMOS 30 DIAS):
     - Volume dos últimos 30 dias: {round(vol_30d, 1)} km
     - Frequência Cardíaca Média (30d): {bpm_med_30d} BPM
-    - Telemetria exata:
+    - Telemetria exata das corridas:
     {payload_para_ia}
     
     INSTRUÇÕES CRÍTICAS:
