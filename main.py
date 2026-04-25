@@ -320,39 +320,30 @@ def sincronizar_treinos(strava_id: int, caminhadas: bool = True):
         res_full = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
         perfil_final = res_full.data[0]
 
-    # 2. Sincronização Delta de Treinos (Se quiser reconstruir sem caminhadas, force do zero baixando tudo)
+    # 2. Sincronização Delta de Treinos
     historico_antigo = atleta_db.get('historico_json') or []
     after_timestamp = None
     
-    # IMPORTANTE: Se o utilizador desativar caminhadas, é melhor limpar o lixo baixando a vida inteira de novo
-    # Então não usamos o after_timestamp se não houver histórico, ou pode manter para Delta normal
     if historico_antigo:
         data_str = historico_antigo[0].get("start_date_local")
         if data_str:
             dt = datetime.fromisoformat(data_str.replace("Z", "+00:00")[:19])
             after_timestamp = int(dt.timestamp()) + 1 
     
-    # Passamos a preferência de caminhadas para o downloader
     treinos_novos = baixar_novos_treinos(access_token, after_timestamp, incluir_caminhadas=caminhadas)
     todos_treinos = treinos_novos + historico_antigo if treinos_novos else historico_antigo
     
-    # 3. FILTRO DE DEDUPLICAÇÃO BLINDADA: 
-    # Remove as duplicatas antigas do banco e impede novas através da chave 'start_date_local'
-    # Além de limpar as caminhadas antigas caso a preferência seja "falsa"
+    # 3. FILTRO DE DEDUPLICAÇÃO BLINDADA
     treinos_unicos = {}
     for t in todos_treinos:
         data_chave = t.get('start_date_local')
-        # Se desligou caminhadas, ignora as antigas que ainda possam estar no array
         if not caminhadas and t.get('name') and "Walk" in t.get('name', ''):
-            pass # Logica leve caso precisemos filtrar por nome/tipo. Como já filtramos na busca, deixamos passar.
-            
+            pass 
         if data_chave not in treinos_unicos:
             treinos_unicos[data_chave] = t
             
-    # Ordena para garantir o mais recente no topo
     historico_atualizado = sorted(list(treinos_unicos.values()), key=lambda x: x.get('start_date_local', ''), reverse=True)
     
-    # Só atualiza o banco se houver treinos novos OU se limpou o lixo do banco (tamanho diminuiu)
     if treinos_novos or len(historico_atualizado) != len(historico_antigo):
         supabase.table("usuarios_strava").update({"historico_json": historico_atualizado}).eq("id", strava_id).execute()
         
@@ -366,20 +357,85 @@ def sincronizar_treinos(strava_id: int, caminhadas: bool = True):
 
 @app.post("/ia/analise")
 def gerar_analise_ia(requisicao: IAAnaliseRequest):
-    """Aciona o Gemini para gerar o Dossiê biomecânico."""
+    """
+    O CÉREBRO DA OPERAÇÃO: "O Funil de Contexto". 
+    Manda para o Gemini a biometria, o resumo Macro (total), Meso (30 dias) e Micro (3 treinos crus).
+    Gasta poucos tokens, mas fornece um diagnóstico clínico profundo.
+    """
     res_db = supabase.table("usuarios_strava").select("*").eq("id", requisicao.strava_id).execute()
     usuario = res_db.data[0]
     historico = usuario.get("historico_json")
     
     if not historico: raise HTTPException(status_code=400, detail="Sem treinos para analisar.")
 
-    payload_para_ia = json.dumps(historico[:3], ensure_ascii=False)
-    altura_txt = f"{usuario.get('altura')}cm" if usuario.get('altura') else "Não informada"
+    # 1. PROCESSAMENTO DE DADOS (Custo Zero de Tokens)
     
+    # Biometria
+    idade = usuario.get('idade') or "Não informada"
+    peso = usuario.get('peso') or "Não informado"
+    genero = usuario.get('genero') or "Não informado"
+    altura_txt = f"{usuario.get('altura')}cm" if usuario.get('altura') else "Não informada"
+
+    # Visão MACRO (Acumulado da vida)
+    vol_total = 0
+    for t in historico: vol_total += t.get('distancia_km', 0)
+    treinos_total = len(historico)
+    
+    # Visão MESO (Últimos 30 dias) e MICRO (JSON Completo)
+    vol_30d = 0
+    bpm_soma = 0
+    treinos_30d = 0
+    treinos_30_dias_brutos = [] # NOVO: Array para guardar os treinos crus do mês
+    limite_30d = datetime.now() - timedelta(days=30)
+    
+    for t in historico:
+        data_str = t.get("start_date_local")
+        if data_str:
+            dt = datetime.fromisoformat(data_str.replace("Z", "+00:00")[:19])
+            if dt >= limite_30d:
+                vol_30d += t.get("distancia_km", 0)
+                bpm_soma += t.get("average_heartrate", 0)
+                treinos_30d += 1
+                treinos_30_dias_brutos.append(t) # Guarda o treino na lista para a IA
+                
+    bpm_med_30d = int(bpm_soma / treinos_30d) if treinos_30d > 0 else 0
+
+    # Agora a IA recebe TODOS os treinos dos últimos 30 dias
+    payload_para_ia = json.dumps(treinos_30_dias_brutos, ensure_ascii=False)
+    
+    # 2. O SUPER PROMPT DE ENGENHARIA
     prompt = f"""
-    Analise o atleta {usuario.get('nome')}. Altura: {altura_txt}. 
-    Use Jack Daniels e princípios biomecânicos (relacione a altura com a cadência) para avaliar: {payload_para_ia}.
-    Retorne ESTRITAMENTE um JSON: 'diagnostico_geral' (2 linhas), 'ponto_de_melhoria' (focado na biomecânica), 'nota_eficiencia' (0 a 10).
+    Atue como um Fisiologista do Esporte e Treinador de Corrida de Elite.
+    O seu objetivo não é apenas analisar a passada, mas gerar um dossiê profundo cruzando as estatísticas vitais, a carga crônica e a carga aguda.
+    
+    📋 PERFIL DO ATLETA E BIOMETRIA:
+    - Nome: {usuario.get('nome')}
+    - Idade: {idade}
+    - Sexo: {genero}
+    - Peso: {peso}kg
+    - Altura: {altura_txt}
+    
+    📊 CARGA CRÔNICA (VISÃO MACRO - Experiência do Atleta):
+    - Total de Treinos Registrados: {treinos_total}
+    - Distância Total Acumulada: {round(vol_total, 1)} km
+    
+    📈 CARGA AGUDA E BIOMECÂNICA (VISÃO DOS ÚLTIMOS 30 DIAS):
+    - Volume dos últimos 30 dias: {round(vol_30d, 1)} km
+    - Frequência Cardíaca Média (30d): {bpm_med_30d} BPM
+    - Telemetria exata de TODOS os treinos dos últimos 30 dias:
+    {payload_para_ia}
+    
+    INSTRUÇÕES CRÍTICAS:
+    1. Use metodologias consagradas (Jack Daniels, Joe Friel, Maffetone 80/20).
+    2. Analise a evolução do atleta ao longo deste mês. Há picos de volume (risco de lesão)?
+    3. Analise o BPM e a distribuição de esforço. Falta base aeróbica (Z2)?
+    4. Avalie a biomecânica (SPM vs Altura vs Pace) cruzando os dados destes 30 dias.
+    5. O tom deve ser de um treinador sênior, provocativo e altamente embasado em dados.
+    
+    Retorne ESTRITAMENTE um JSON válido contendo exatamente estas chaves:
+    "diagnostico_geral": "Avaliação clínica e fisiológica profunda sobre o mês do atleta cruzando o volume total, o mês atual e a biometria (máximo de 4 linhas).",
+    "ponto_de_melhoria": "Insight prático e direto baseado nos padrões repetitivos encontrados neste mês. Pode ser sobre risco de overtraining, falta de volume Z2 ou erro mecânico (passada vs altura).",
+    "nota_eficiencia": <Um número inteiro de 0 a 10 que reflita a real economia mecânica e cardiovascular do atleta neste ciclo de 30 dias>
     """
     
     client = genai.Client(api_key=GEMINI_API_KEY)
