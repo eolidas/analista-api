@@ -127,6 +127,10 @@ def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
 
 def construir_perfil_seguro(dados: dict) -> dict:
     """Garante que o objeto de perfil nunca tenha campos nulos fatais para o React."""
+    equip = dados.get("equipamentos")
+    if not isinstance(equip, dict):
+        equip = {"tenis": [], "bicicletas": []}
+    
     return {
         "nome": dados.get("nome") or "Atleta",
         "sobrenome": dados.get("sobrenome") or "",
@@ -140,7 +144,7 @@ def construir_perfil_seguro(dados: dict) -> dict:
         "data_criacao": dados.get("data_criacao") or "",
         "bio": dados.get("bio") or "",
         "clubes": dados.get("clubes") or [],
-        "equipamentos": dados.get("equipamentos") or {"tenis": [], "bicicletas": []}
+        "equipamentos": equip
     }
 
 # ==========================================
@@ -272,18 +276,23 @@ def sincronizar_treinos(strava_id: int):
     return {
         "status": "success", 
         "novos": len(treinos_novos),
-        "historico_json": historico_atualizado, # CHAVE CORRIGIDA: De 'historico' para 'historico_json'
+        "historico_json": historico_atualizado,
         "perfil": construir_perfil_seguro(final_db)
     }
 
 @app.post("/ia/analise")
 def gerar_analise_ia(requisicao: IAAnaliseRequest):
+    """
+    Motor Blindado: IA analisa apenas Corridas, com compressão de dados
+    para economizar tokens e evitar estouro de limite.
+    """
     res_db = supabase.table("usuarios_strava").select("*").eq("id", requisicao.strava_id).execute()
     usuario = res_db.data[0]
     historico = usuario.get("historico_json")
     
     if not historico: raise HTTPException(status_code=400, detail="Sem treinos para analisar.")
 
+    # Filtramos apenas atividades que sejam corridas para a IA
     historico_corridas = [t for t in historico if t.get('type', 'Run') == 'Run']
     if not historico_corridas: raise HTTPException(status_code=400, detail="Sem corridas cadastradas para análise IA.")
 
@@ -314,6 +323,7 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
     bpm_med_30d = int(bpm_soma / treinos_30d) if treinos_30d > 0 else 0
     if not treinos_30_dias_brutos: treinos_30_dias_brutos = historico_corridas[:3]
 
+    # === COMPRESSÃO DE DADOS PARA ECONOMIA DE TOKENS ===
     resumo_treinos = []
     for t in treinos_30_dias_brutos:
         linha = f"[{t.get('start_date_local', '')[:10]}] {round(t.get('distancia_km', 0), 1)}km | Pace: {t.get('Pace_Medio', '00:00')} | BPM: {int(t.get('average_heartrate', 0))} | SPM: {int(t.get('Cadence_SPM', 0))}"
