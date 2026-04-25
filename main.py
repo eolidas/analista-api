@@ -195,7 +195,7 @@ def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
     
     provas = [t for t in historico if t.get('workout_type') == 1]
     if not provas:
-        return {"status": "success", "analisados": 0, "trofeus": usuario.get("trofeus_json") or {}, "msg": "Nenhuma prova oficial encontrada. Marque o evento como 'Corrida' (Race) no Strava e sincronize primeiro."}
+        return {"status": "success", "analisados": 0, "trofeus": usuario.get("trofeus_json") or {}, "msg": "Nenhuma prova oficial encontrada. Mude a tag da atividade no Strava para 'Corrida' (Race) e sincronize novamente."}
 
     headers = {'Authorization': f'Bearer {token}'}
     trofeus_atuais = usuario.get("trofeus_json") or {}
@@ -215,7 +215,7 @@ def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
                 tempo_segundos = effort.get('elapsed_time')
                 
                 atual = trofeus_atuais.get(chave)
-                # A GRANDE CORREÇÃO: Atualiza o troféu se for novo, se for mais rápido, OU se já existir mas estiver sem FC!
+                # Atualiza o troféu se for novo, se for mais rápido, OU se já existir mas estiver sem FC (Correção de Bug)
                 if not atual or tempo_segundos < atual['tempo_segundos'] or (tempo_segundos == atual['tempo_segundos'] and ('fc_media' not in atual or atual['fc_media'] == 0)):
                     h, m, s = int(tempo_segundos // 3600), int((tempo_segundos % 3600) // 60), int(tempo_segundos % 60)
                     trofeus_atuais[chave] = {
@@ -235,8 +235,9 @@ def motor_ia_gemini(requisicao: IAAnaliseRequest):
     res_db = supabase.table("usuarios_strava").select("*").eq("id", requisicao.strava_id).execute()
     atleta = res_db.data[0]
     historico = atleta.get("historico_json") or []
-    if not historico: raise HTTPException(status_code=400)
+    if not historico: raise HTTPException(status_code=400, detail="Sem treinos para analisar.")
 
+    # Extrai os últimos 12 treinos
     resumo_treinos = [f"[{t['start_date_local'][:10]}] {round(t['distancia_km'], 1)}km | Pace: {t['Pace_Medio']} | BPM: {int(t['average_heartrate'])}" for t in historico[:12]]
     prompt = f"Analise o atleta {atleta['nome']}, {atleta.get('idade')} anos, {atleta.get('peso')}kg. \n{chr(10).join(resumo_treinos)}\nRetorne JSON: diagnostico_geral, ponto_de_melhoria, nota_eficiencia (0-10)."
     
@@ -247,7 +248,7 @@ def motor_ia_gemini(requisicao: IAAnaliseRequest):
         supabase.table("usuarios_strava").update({"ia_report_json": resultado}).eq("id", requisicao.strava_id).execute()
         return resultado
     except Exception:
-        raise HTTPException(status_code=500)
+        raise HTTPException(status_code=500, detail="Falha no motor de IA.")
 
 @app.put("/atleta/{strava_id}/biometria")
 def atualizar_biometria(strava_id: int, req: BiometriaRequest):
