@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
@@ -48,9 +49,9 @@ class IAAnaliseRequest(BaseModel):
     strava_id: int
 
 class BiometriaRequest(BaseModel):
-    peso: float
-    altura: float
-    idade: int
+    peso: Optional[float] = None
+    altura: Optional[float] = None
+    idade: Optional[int] = None
 
 # ==========================================
 # ⚙️ FUNÇÕES AUXILIARES & REGRAS DE NEGÓCIO
@@ -218,15 +219,21 @@ def autenticar_strava(requisicao: StravaAuthRequest):
 
 @app.put("/atleta/{strava_id}/biometria")
 def atualizar_biometria(strava_id: int, req: BiometriaRequest):
-    """Atualiza Peso, Altura e Idade manualmente no Supabase."""
-    res = supabase.table("usuarios_strava").update({
-        "peso": req.peso,
-        "altura": req.altura,
-        "idade": req.idade
-    }).eq("id", strava_id).execute()
+    """Atualiza Peso, Altura e Idade manualmente no Supabase (Atualização Parcial)."""
+    update_data = {}
     
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Atleta não encontrado")
+    if req.peso is not None:
+        update_data["peso"] = req.peso
+    if req.altura is not None:
+        update_data["altura"] = req.altura
+    if req.idade is not None:
+        update_data["idade"] = req.idade
+        
+    if update_data:
+        res = supabase.table("usuarios_strava").update(update_data).eq("id", strava_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Atleta não encontrado")
+            
     return {"status": "success"}
 
 @app.get("/atleta/{strava_id}")
@@ -331,7 +338,7 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
     """
     
     client = genai.Client(api_key=GEMINI_API_KEY)
-    res_ia = client.models.generate_content(
+    resposta_ia = client.models.generate_content(
         model='gemini-2.5-flash',
         contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json")
