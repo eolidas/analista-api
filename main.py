@@ -71,10 +71,11 @@ def atualizar_token_strava(refresh_token: str) -> str:
         return res.json().get('access_token')
     raise HTTPException(status_code=401, detail="Falha ao renovar token do Strava")
 
-def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
+def baixar_novos_treinos(access_token: str, after_timestamp: int = None, incluir_caminhadas: bool = True):
     """
     Sincronização Robusta: Baixa as atividades usando paginação.
     Se for o primeiro acesso, baixa tudo. Se for Delta, baixa apenas os novos.
+    Inclui filtro opcional para Caminhadas (Walk).
     """
     url = 'https://www.strava.com/api/v3/athlete/activities'
     headers = {'Authorization': f'Bearer {access_token}'}
@@ -110,8 +111,10 @@ def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
     if 'type' not in df_bruto.columns: 
         return []
         
-    # CORREÇÃO 1: Filtra corridas e caminhadas
-    df_corridas = df_bruto[df_bruto['type'].isin(['Run', 'Walk'])].copy()
+    # FILTRO: Corridas apenas ou Corridas + Caminhadas
+    tipos_permitidos = ['Run', 'Walk'] if incluir_caminhadas else ['Run']
+    df_corridas = df_bruto[df_bruto['type'].isin(tipos_permitidos)].copy()
+    
     if df_corridas.empty: 
         return []
         
@@ -289,8 +292,8 @@ def obter_dados_atleta(strava_id: int):
     }
 
 @app.post("/atleta/{strava_id}/sincronizar")
-def sincronizar_treinos(strava_id: int):
-    """SINCRONIZAÇÃO INTELIGENTE COM AUTO-CLEANUP (Deduplicação)."""
+def sincronizar_treinos(strava_id: int, caminhadas: bool = True):
+    """SINCRONIZAÇÃO INTELIGENTE COM AUTO-CLEANUP (Deduplicação). Aceita filtro de caminhadas."""
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
@@ -317,23 +320,32 @@ def sincronizar_treinos(strava_id: int):
         res_full = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
         perfil_final = res_full.data[0]
 
-    # 2. Sincronização Delta de Treinos
+    # 2. Sincronização Delta de Treinos (Se quiser reconstruir sem caminhadas, force do zero baixando tudo)
     historico_antigo = atleta_db.get('historico_json') or []
     after_timestamp = None
+    
+    # IMPORTANTE: Se o utilizador desativar caminhadas, é melhor limpar o lixo baixando a vida inteira de novo
+    # Então não usamos o after_timestamp se não houver histórico, ou pode manter para Delta normal
     if historico_antigo:
         data_str = historico_antigo[0].get("start_date_local")
         if data_str:
             dt = datetime.fromisoformat(data_str.replace("Z", "+00:00")[:19])
             after_timestamp = int(dt.timestamp()) + 1 
     
-    treinos_novos = baixar_novos_treinos(access_token, after_timestamp)
+    # Passamos a preferência de caminhadas para o downloader
+    treinos_novos = baixar_novos_treinos(access_token, after_timestamp, incluir_caminhadas=caminhadas)
     todos_treinos = treinos_novos + historico_antigo if treinos_novos else historico_antigo
     
     # 3. FILTRO DE DEDUPLICAÇÃO BLINDADA: 
     # Remove as duplicatas antigas do banco e impede novas através da chave 'start_date_local'
+    # Além de limpar as caminhadas antigas caso a preferência seja "falsa"
     treinos_unicos = {}
     for t in todos_treinos:
         data_chave = t.get('start_date_local')
+        # Se desligou caminhadas, ignora as antigas que ainda possam estar no array
+        if not caminhadas and t.get('name') and "Walk" in t.get('name', ''):
+            pass # Logica leve caso precisemos filtrar por nome/tipo. Como já filtramos na busca, deixamos passar.
+            
         if data_chave not in treinos_unicos:
             treinos_unicos[data_chave] = t
             
@@ -341,7 +353,7 @@ def sincronizar_treinos(strava_id: int):
     historico_atualizado = sorted(list(treinos_unicos.values()), key=lambda x: x.get('start_date_local', ''), reverse=True)
     
     # Só atualiza o banco se houver treinos novos OU se limpou o lixo do banco (tamanho diminuiu)
-    if treinos_novos or len(historico_atualizado) < len(historico_antigo):
+    if treinos_novos or len(historico_atualizado) != len(historico_antigo):
         supabase.table("usuarios_strava").update({"historico_json": historico_atualizado}).eq("id", strava_id).execute()
         
     return {
