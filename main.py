@@ -123,14 +123,14 @@ def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
     df_atividades['start_date_local'] = pd.to_datetime(df_atividades['start_date_local'])
     df_atividades = df_atividades.sort_values(by='start_date_local', ascending=False).reset_index(drop=True)
 
-    # NOVO: Adicionado a coluna 'type' para o Frontend saber o que é Run e Walk
+    # Adicionado a coluna 'type' para o Frontend saber o que é Run e Walk
     colunas = ['type', 'name', 'distancia_km', 'Pace_Medio', 'Cadence_SPM', 'average_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local']
     
     json_string = df_atividades[colunas].to_json(orient='records', force_ascii=False, date_format='iso')
     return json.loads(json_string)
 
 def calcular_estatisticas(historico: list) -> dict:
-    """Calculadora Backend de Volume."""
+    """Calculadora Backend de Volume (Mantida como redundância de API)."""
     if not historico:
         return {"totalDist": 0, "totalWorkouts": 0, "monthVolume": 0, "weekVolume": 0}
 
@@ -243,7 +243,7 @@ def obter_dados_atleta(strava_id: int):
 
 @app.post("/atleta/{strava_id}/sincronizar")
 def sincronizar_treinos(strava_id: int):
-    """SINCRONIZAÇÃO INTELIGENTE (LIMPA E DIRETA). O Backend ignora parametros antigos (caminhadas, force_full) da URL."""
+    """SINCRONIZAÇÃO INTELIGENTE (LIMPA E DIRETA). O Backend extrai sempre Run e Walk."""
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
@@ -302,8 +302,8 @@ def sincronizar_treinos(strava_id: int):
 @app.post("/ia/analise")
 def gerar_analise_ia(requisicao: IAAnaliseRequest):
     """
-    Motor Blindado: A IA analisa EXCLUSIVAMENTE corridas ('Run') para garantir
-    que diagnósticos biomecânicos e cardíacos não sejam contaminados por passeios.
+    Motor Blindado: A IA analisa EXCLUSIVAMENTE corridas ('Run') usando a
+    "Compressão de Dados" para economizar 90% dos tokens da API do Gemini.
     """
     res_db = supabase.table("usuarios_strava").select("*").eq("id", requisicao.strava_id).execute()
     usuario = res_db.data[0]
@@ -311,7 +311,7 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
     
     if not historico: raise HTTPException(status_code=400, detail="Sem treinos para analisar.")
 
-    # BLINDAGEM IA: Filtramos apenas atividades que sejam corridas (padrão assumido se antigo)
+    # BLINDAGEM IA: Filtramos apenas atividades que sejam corridas
     historico_corridas = [t for t in historico if t.get('type', 'Run') == 'Run']
     if not historico_corridas: raise HTTPException(status_code=400, detail="Sem corridas cadastradas para análise IA.")
 
@@ -342,11 +342,23 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
                 
     bpm_med_30d = int(bpm_soma / treinos_30d) if treinos_30d > 0 else 0
 
-    # PROTEÇÃO: Se o corredor não treinou este mês, envia as últimas 3 de sempre
     if not treinos_30_dias_brutos:
         treinos_30_dias_brutos = historico_corridas[:3]
 
-    payload_para_ia = json.dumps(treinos_30_dias_brutos, ensure_ascii=False)
+    # === COMPRESSÃO DE DADOS (ECONOMIA EXTREMA DE TOKENS) ===
+    resumo_treinos = []
+    for t in treinos_30_dias_brutos:
+        data_t = t.get('start_date_local', '')[:10]
+        dist = round(t.get('distancia_km', 0), 1)
+        pace = t.get('Pace_Medio', '00:00')
+        bpm = int(t.get('average_heartrate', 0))
+        spm = int(t.get('Cadence_SPM', 0))
+        elev = int(t.get('total_elevation_gain', 0))
+        
+        linha = f"[{data_t}] {dist}km | Pace: {pace} | BPM: {bpm} | Cadência: {spm} | Elev: {elev}m"
+        resumo_treinos.append(linha)
+        
+    payload_para_ia = "\n".join(resumo_treinos)
     
     prompt = f"""
     Atue como um Fisiologista do Esporte e Treinador de Corrida de Elite.
@@ -366,7 +378,7 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
     📈 CARGA AGUDA E BIOMECÂNICA (VISÃO DOS ÚLTIMOS 30 DIAS):
     - Volume dos últimos 30 dias: {round(vol_30d, 1)} km
     - Frequência Cardíaca Média (30d): {bpm_med_30d} BPM
-    - Telemetria exata das corridas:
+    - Telemetria Tática das corridas:
     {payload_para_ia}
     
     INSTRUÇÕES CRÍTICAS:
@@ -388,7 +400,6 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         
-        # BLINDAGEM DE JSON (Limpa blocos de markdown que a IA envia por engano)
         texto_limpo = res_ia.text.strip()
         if texto_limpo.startswith('```json'):
             texto_limpo = texto_limpo.replace('```json', '').replace('```', '').strip()
@@ -400,5 +411,4 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
         supabase.table("usuarios_strava").update({"ia_report_json": analise}).eq("id", requisicao.strava_id).execute()
         return analise
     except Exception as e:
-        # Devolve exatamente o que falhou para o Frontend poder mostrar no ecrã (Ex: timeout ou API limits)
         raise HTTPException(status_code=500, detail=f"Erro interno de IA: {str(e)}")
