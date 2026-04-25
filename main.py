@@ -73,27 +73,47 @@ def atualizar_token_strava(refresh_token: str) -> str:
 
 def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
     """
-    Sincronização Delta: Procura no Strava APENAS atividades após o timestamp informado.
+    Sincronização Robusta: Baixa as atividades usando paginação.
+    Se for o primeiro acesso, baixa tudo. Se for Delta, baixa apenas os novos.
     """
     url = 'https://www.strava.com/api/v3/athlete/activities'
     headers = {'Authorization': f'Bearer {access_token}'}
-    params = {'per_page': 50, 'page': 1}
     
-    if after_timestamp:
-        params['after'] = after_timestamp
+    atividades_totais = []
+    pagina = 1
+    
+    # Loop de Paginação para baixar todo o histórico necessário
+    while True:
+        params = {'per_page': 200, 'page': pagina}
+        if after_timestamp:
+            params['after'] = after_timestamp
 
-    res = requests.get(url, headers=headers, params=params)
-    if res.status_code != 200: return []
+        res = requests.get(url, headers=headers, params=params)
+        if res.status_code != 200: 
+            break
+            
+        dados_pagina = res.json()
+        if not dados_pagina: 
+            break
+            
+        atividades_totais.extend(dados_pagina)
+        pagina += 1
         
-    dados = res.json()
-    if not dados: return []
+        # Se a página retornou menos de 200 itens, chegamos ao fim.
+        if len(dados_pagina) < 200:
+            break
+
+    if not atividades_totais: 
+        return []
         
-    df_bruto = pd.DataFrame(dados)
-    if 'type' not in df_bruto.columns: return []
+    df_bruto = pd.DataFrame(atividades_totais)
+    if 'type' not in df_bruto.columns: 
+        return []
         
-    # Filtra apenas corridas
+    # CORREÇÃO 1: Filtra corridas e caminhadas
     df_corridas = df_bruto[df_bruto['type'].isin(['Run', 'Walk'])].copy()
-    if df_corridas.empty: return []
+    if df_corridas.empty: 
+        return []
         
     df_corridas['distancia_km'] = df_corridas['distance'] / 1000.0
     
@@ -186,7 +206,7 @@ def autenticar_strava(requisicao: StravaAuthRequest):
     atleta_resumo = token_payload.get('athlete', {})
     atleta_id = atleta_resumo.get('id')
     
-    # Busca o Perfil Detalhado no Strava (Peso, Clubes, Ténis)
+    # Busca o Perfil Detalhado no Strava
     headers = {'Authorization': f'Bearer {access_token}'}
     res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
     atleta = res_perfil.json() if res_perfil.status_code == 200 else atleta_resumo
@@ -303,7 +323,9 @@ def sincronizar_treinos(strava_id: int):
     if historico_antigo:
         data_str = historico_antigo[0].get("start_date_local")
         if data_str:
-            after_timestamp = int(datetime.fromisoformat(data_str.replace("Z", "+00:00")[:19]).timestamp())
+            # CORREÇÃO 2: Adiciona +1 segundo ao timestamp para evitar duplicação
+            dt = datetime.fromisoformat(data_str.replace("Z", "+00:00")[:19])
+            after_timestamp = int(dt.timestamp()) + 1 
     
     treinos_novos = baixar_novos_treinos(access_token, after_timestamp)
     historico_atualizado = treinos_novos + historico_antigo if treinos_novos else historico_antigo
@@ -316,7 +338,7 @@ def sincronizar_treinos(strava_id: int):
         "novos": len(treinos_novos),
         "historico": historico_atualizado,
         "estatisticas": calcular_estatisticas(historico_atualizado),
-        "perfil": perfil_final # Retorna o perfil atualizado do Strava
+        "perfil": perfil_final 
     }
 
 @app.post("/ia/analise")
@@ -338,7 +360,7 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
     """
     
     client = genai.Client(api_key=GEMINI_API_KEY)
-    resposta_ia = client.models.generate_content(
+    res_ia = client.models.generate_content(
         model='gemini-2.5-flash',
         contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json")
