@@ -253,18 +253,44 @@ def sincronizar_treinos(strava_id: int):
     # 1. Sync do Perfil
     headers = {'Authorization': f'Bearer {access_token}'}
     res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
-    perfil_final = None
+    
     if res_perfil.status_code == 200:
         s = res_perfil.json()
         equipamentos = {"tenis": s.get('shoes', []), "bicicletas": s.get('bikes', [])}
         clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in s.get('clubs', [])]
+        
         perfil_upd = {
-            "peso": s.get('weight'), "cidade": s.get('city'), "estado": s.get('state'),
+            "cidade": s.get('city'), "estado": s.get('state'),
             "equipamentos": equipamentos, "clubes": clubes, "foto_url": s.get('profile')
         }
+        
+        # PROTEÇÃO DE DADOS: Só atualiza o peso vindo do Strava se ele existir. 
+        # Isso impede que o Strava apague o peso inserido manualmente caso devolva null.
+        peso_strava = s.get('weight')
+        if peso_strava:
+            perfil_upd["peso"] = peso_strava
+            
         supabase.table("usuarios_strava").update(perfil_upd).eq("id", strava_id).execute()
-        res_full = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
-        perfil_final = res_full.data[0]
+
+    # FORMATADOR ESTILIZADO: Sempre devolve o perfil limpo e exato para o Frontend.
+    # Isso evita enviar a tabela inteira (com os históricos pesados) e bugar o React.
+    res_full = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
+    dados = res_full.data[0]
+    perfil_final = {
+        "nome": dados.get("nome"),
+        "sobrenome": dados.get("sobrenome"),
+        "foto_url": dados.get("foto_url"),
+        "peso": dados.get("peso"),
+        "altura": dados.get("altura"),
+        "idade": dados.get("idade"),
+        "cidade": dados.get("cidade"),
+        "estado": dados.get("estado"),
+        "genero": dados.get("genero"),
+        "data_criacao": dados.get("data_criacao"),
+        "bio": dados.get("bio"),
+        "clubes": dados.get("clubes"),
+        "equipamentos": dados.get("equipamentos")
+    }
 
     # 2. Sync de Treinos (Apenas Delta Clássico)
     historico_antigo = atleta_db.get('historico_json') or []
