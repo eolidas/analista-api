@@ -48,6 +48,7 @@ class IAAnaliseRequest(BaseModel):
 class BiometriaRequest(BaseModel):
     peso: float
     altura: float
+    idade: int
 
 # ==========================================
 # ⚙️ FUNÇÕES AUXILIARES & REGRAS DE NEGÓCIO
@@ -225,6 +226,7 @@ def atualizar_biometria(strava_id: int, req: BiometriaRequest):
     res = supabase.table("usuarios_strava").update({
         "peso": req.peso,
         "altura": req.altura
+        "idade": req.idade
     }).eq("id", strava_id).execute()
     
     if not res.data:
