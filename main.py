@@ -250,14 +250,15 @@ def sincronizar_treinos(strava_id: int):
     precisa_reconstruir = False
     
     if historico_antigo:
-        primeiro_treino = historico_antigo[0]
-        if 'id' not in primeiro_treino or 'workout_type' not in primeiro_treino:
+        # CORREÇÃO: Em vez de olhar só para o primeiro treino, 
+        # verifica se ALGUM treino em todo o histórico está sem a tag.
+        if any('workout_type' not in t or 'id' not in t for t in historico_antigo):
             precisa_reconstruir = True
 
     after_timestamp = None
     
     if precisa_reconstruir:
-        # Esvazia a memória local para o algoritmo puxar TUDO do Strava do zero, com as novas colunas
+        # Esvazia a memória local para o algoritmo puxar TUDO do Strava do zero
         historico_antigo = []
     elif historico_antigo:
         try:
