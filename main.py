@@ -290,7 +290,7 @@ def obter_dados_atleta(strava_id: int):
 
 @app.post("/atleta/{strava_id}/sincronizar")
 def sincronizar_treinos(strava_id: int):
-    """SINCRONIZAÇÃO INTELIGENTE: Baixa treinos novos E atualiza Perfil (Peso/Equipamentos)."""
+    """SINCRONIZAÇÃO INTELIGENTE COM AUTO-CLEANUP (Deduplicação)."""
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
@@ -323,14 +323,25 @@ def sincronizar_treinos(strava_id: int):
     if historico_antigo:
         data_str = historico_antigo[0].get("start_date_local")
         if data_str:
-            # CORREÇÃO 2: Adiciona +1 segundo ao timestamp para evitar duplicação
             dt = datetime.fromisoformat(data_str.replace("Z", "+00:00")[:19])
             after_timestamp = int(dt.timestamp()) + 1 
     
     treinos_novos = baixar_novos_treinos(access_token, after_timestamp)
-    historico_atualizado = treinos_novos + historico_antigo if treinos_novos else historico_antigo
+    todos_treinos = treinos_novos + historico_antigo if treinos_novos else historico_antigo
     
-    if treinos_novos:
+    # 3. FILTRO DE DEDUPLICAÇÃO BLINDADA: 
+    # Remove as duplicatas antigas do banco e impede novas através da chave 'start_date_local'
+    treinos_unicos = {}
+    for t in todos_treinos:
+        data_chave = t.get('start_date_local')
+        if data_chave not in treinos_unicos:
+            treinos_unicos[data_chave] = t
+            
+    # Ordena para garantir o mais recente no topo
+    historico_atualizado = sorted(list(treinos_unicos.values()), key=lambda x: x.get('start_date_local', ''), reverse=True)
+    
+    # Só atualiza o banco se houver treinos novos OU se limpou o lixo do banco (tamanho diminuiu)
+    if treinos_novos or len(historico_atualizado) < len(historico_antigo):
         supabase.table("usuarios_strava").update({"historico_json": historico_atualizado}).eq("id", strava_id).execute()
         
     return {
