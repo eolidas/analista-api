@@ -250,15 +250,13 @@ def sincronizar_treinos(strava_id: int):
     precisa_reconstruir = False
     
     if historico_antigo:
-        # CORREÇÃO: Em vez de olhar só para o primeiro treino, 
-        # verifica se ALGUM treino em todo o histórico está sem a tag.
+        # Verifica se ALGUM treino em todo o histórico está sem a tag.
         if any('workout_type' not in t or 'id' not in t for t in historico_antigo):
             precisa_reconstruir = True
 
     after_timestamp = None
     
     if precisa_reconstruir:
-        # Esvazia a memória local para o algoritmo puxar TUDO do Strava do zero
         historico_antigo = []
     elif historico_antigo:
         try:
@@ -381,28 +379,32 @@ def garimpar_trofeus(strava_id: int, req: TrofeusRequest):
         raise HTTPException(status_code=401, detail="Falha ao renovar token. Faça login novamente.")
 
     historico = usuario.get("historico_json") or []
-    
     corridas = [t for t in historico if t.get('type') == 'Run' and t.get('id') is not None]
     
-    if req.somente_provas:
-        alvos = [t for t in corridas if t.get('workout_type') == 1]
-    else:
-        alvos = sorted(corridas, key=lambda x: x.get('distancia_km', 0), reverse=True)[:20]
+    # REFORÇO DE ARQUITETURA: Pesquisa cravada exclusivamente em Provas Oficiais.
+    alvos = [t for t in corridas if t.get('workout_type') == 1]
         
-    # Devolve o número 0 para "analisados" caso a lista esteja vazia, para não quebrar o Frontend
     if not alvos:
         return {
             "status": "success", 
             "analisados": 0, 
             "trofeus": usuario.get("trofeus_json") or {}, 
-            "msg": "Nenhuma Prova encontrada no banco. DICA: Faça uma nova sincronização do histórico para puxar as etiquetas oficiais do Strava."
+            "msg": "Nenhuma Prova encontrada no banco. DICA: Verifique se marcou seus recordes como 'Prova' no Strava e clique em 'Sincronizar Novos Dados'."
         }
 
     headers = {'Authorization': f'Bearer {access_token}'}
-    
     trofeus = usuario.get("trofeus_json") or {}
-    distancias_alvo = ["1k", "5k", "10k", "Half Marathon", "Marathon"]
-    for dist in distancias_alvo:
+    
+    # Mapeamento blindado contra variações de maiúsculas/minúsculas do Strava API (ex: 5K vs 5k)
+    mapa_distancias = {
+        "1k": "1k",
+        "5k": "5k",
+        "10k": "10k",
+        "half marathon": "Half Marathon",
+        "marathon": "Marathon"
+    }
+    
+    for dist in mapa_distancias.values():
         if dist not in trofeus:
             trofeus[dist] = None
             
@@ -415,11 +417,15 @@ def garimpar_trofeus(strava_id: int, req: TrofeusRequest):
         best_efforts = detalhes.get('best_efforts') or []
         
         for effort in best_efforts:
-            nome_esforco = effort.get('name')
-            if nome_esforco in distancias_alvo:
+            nome_esforco_raw = effort.get('name', '')
+            nome_esforco_lower = nome_esforco_raw.lower()
+            
+            # Match perfeito: converte "5K" do Strava para "5k" e cruza com o nosso dicionário
+            if nome_esforco_lower in mapa_distancias:
+                chave_frontend = mapa_distancias[nome_esforco_lower]
                 tempo_atual = effort.get('elapsed_time')
                 
-                if trofeus[nome_esforco] is None or tempo_atual < trofeus[nome_esforco]['tempo_segundos']:
+                if trofeus[chave_frontend] is None or tempo_atual < trofeus[chave_frontend]['tempo_segundos']:
                     h = int(tempo_atual // 3600)
                     m = int((tempo_atual % 3600) // 60)
                     s = int(tempo_atual % 60)
@@ -429,7 +435,7 @@ def garimpar_trofeus(strava_id: int, req: TrofeusRequest):
                     else:
                         tempo_formatado = f"{m}m {s:02d}s"
 
-                    trofeus[nome_esforco] = {
+                    trofeus[chave_frontend] = {
                         "tempo_segundos": tempo_atual,
                         "tempo_formatado": tempo_formatado,
                         "nome_treino": treino.get('name'),
