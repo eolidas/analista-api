@@ -92,7 +92,7 @@ def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
     if 'type' not in df_bruto.columns: return []
         
     # Filtra apenas corridas
-    df_corridas = df_bruto[df_bruto['type'] == 'Run'].copy()
+    df_corridas = df_bruto[df_bruto['type'].isin(['Run', 'Walk'])].copy()
     if df_corridas.empty: return []
         
     df_corridas['distancia_km'] = df_corridas['distance'] / 1000.0
