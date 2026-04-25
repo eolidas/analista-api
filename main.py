@@ -12,11 +12,10 @@ from google.genai import types
 from supabase import create_client, Client
 
 # ==========================================
-# MOTOR ANALISTA DE BOLSO - BACKEND (FastAPI)
-# Missão: Sincronização Inteligente & Fonte da Verdade
+# MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
+# Versão: 2.0.0 - Blindagem Total & Detecção Profunda
 # ==========================================
 
-# Carregamento das variáveis de ambiente
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
 STRAVA_CLIENT_SECRET = os.getenv("STRAVA_CLIENT_SECRET")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -53,400 +52,205 @@ class TrofeusRequest(BaseModel):
     somente_provas: bool
 
 # ==========================================
-# ⚙️ FUNÇÕES AUXILIARES & REGRAS DE NEGÓCIO
+# ⚙️ FUNÇÕES DE ENGENHARIA DE DADOS
 # ==========================================
 
 def atualizar_token_strava(refresh_token: str) -> str:
     url = 'https://www.strava.com/oauth/token'
-    payload = {
-        'client_id': STRAVA_CLIENT_ID,
-        'client_secret': STRAVA_CLIENT_SECRET,
-        'refresh_token': refresh_token,
-        'grant_type': 'refresh_token'
-    }
+    payload = {'client_id': STRAVA_CLIENT_ID, 'client_secret': STRAVA_CLIENT_SECRET, 'refresh_token': refresh_token, 'grant_type': 'refresh_token'}
     res = requests.post(url, data=payload)
     if res.status_code == 200:
         return res.json().get('access_token')
-    raise HTTPException(status_code=401, detail="Falha ao renovar token do Strava")
+    raise HTTPException(status_code=401, detail="Sessão Strava expirada. Faça login novamente no PWA.")
 
-def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
-    url = 'https://www.strava.com/api/v3/athlete/activities'
-    headers = {'Authorization': f'Bearer {access_token}'}
+def formatar_atividades_para_banco(lista_bruta):
+    if not lista_bruta: return []
+    df = pd.DataFrame(lista_bruta)
     
-    atividades_totais = []
-    pagina = 1
-    
-    while True:
-        params = {'per_page': 200, 'page': pagina}
-        if after_timestamp:
-            params['after'] = after_timestamp
+    df = df[df['type'].isin(['Run', 'Walk'])].copy()
+    if df.empty: return []
 
-        res = requests.get(url, headers=headers, params=params)
-        if res.status_code != 200: break
-            
-        dados_pagina = res.json()
-        if not dados_pagina: break
-            
-        atividades_totais.extend(dados_pagina)
-        pagina += 1
-        
-        if len(dados_pagina) < 200: break
-
-    if not atividades_totais: return []
-        
-    df_bruto = pd.DataFrame(atividades_totais)
-    if 'type' not in df_bruto.columns: return []
-        
-    df_atividades = df_bruto[df_bruto['type'].isin(['Run', 'Walk'])].copy()
+    df['distancia_km'] = df['distance'] / 1000.0
+    df['workout_type'] = df['workout_type'].fillna(0).astype(int)
     
-    if df_atividades.empty: return []
-        
-    df_atividades['distancia_km'] = df_atividades['distance'] / 1000.0
-    
-    # Tratamento Seguro do workout_type (Padrão 0 = Comum, 1 = Prova)
-    if 'workout_type' not in df_atividades.columns:
-        df_atividades['workout_type'] = 0
-    else:
-        df_atividades['workout_type'] = df_atividades['workout_type'].fillna(0).astype(int)
-    
-    def formatar_pace(linha):
+    def calc_pace_mm_ss(linha):
         if linha['distancia_km'] == 0: return "00:00"
         pace_dec = (linha['moving_time'] / 60) / linha['distancia_km']
         return f"{int(pace_dec):02d}:{int(round((pace_dec - int(pace_dec)) * 60)):02d}"
         
-    df_atividades['Pace_Medio'] = df_atividades.apply(formatar_pace, axis=1)
-    df_atividades['Cadence_SPM'] = df_atividades['average_cadence'] * 2 if 'average_cadence' in df_atividades.columns else 0
-    df_atividades['average_heartrate'] = df_atividades['average_heartrate'].fillna(0) if 'average_heartrate' in df_atividades.columns else 0
-    df_atividades['total_elevation_gain'] = df_atividades['total_elevation_gain'] if 'total_elevation_gain' in df_atividades.columns else 0
-        
-    df_atividades['start_date_local'] = pd.to_datetime(df_atividades['start_date_local'])
-    df_atividades = df_atividades.sort_values(by='start_date_local', ascending=False).reset_index(drop=True)
-
-    colunas = ['id', 'type', 'workout_type', 'name', 'distancia_km', 'Pace_Medio', 'Cadence_SPM', 'average_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local']
+    df['Pace_Medio'] = df.apply(calc_pace_mm_ss, axis=1)
     
-    json_string = df_atividades[colunas].to_json(orient='records', force_ascii=False, date_format='iso')
-    return json.loads(json_string)
+    # Extração robusta das telemetrias
+    df['average_heartrate'] = df['average_heartrate'].fillna(0) if 'average_heartrate' in df.columns else 0
+    df['max_heartrate'] = df['max_heartrate'].fillna(0) if 'max_heartrate' in df.columns else 0
+    df['Cadence_SPM'] = df['average_cadence'] * 2 if 'average_cadence' in df.columns else 0
+    df['total_elevation_gain'] = df['total_elevation_gain'].fillna(0) if 'total_elevation_gain' in df.columns else 0
+    
+    colunas_finais = ['id', 'type', 'workout_type', 'name', 'distancia_km', 'Pace_Medio', 'average_heartrate', 'max_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local']
+    res_json = df[colunas_finais].to_json(orient='records', force_ascii=False, date_format='iso')
+    return json.loads(res_json)
 
-def construir_perfil_seguro(dados: dict) -> dict:
-    equip = dados.get("equipamentos")
+def construir_perfil_seguro(dados_db: dict) -> dict:
+    """O Guardião do Frontend: Garante que os dados enviados ao React sejam inquebráveis."""
+    equip = dados_db.get("equipamentos")
     if not isinstance(equip, dict):
         equip = {"tenis": [], "bicicletas": []}
     
     return {
-        "nome": dados.get("nome") or "Atleta",
-        "sobrenome": dados.get("sobrenome") or "",
-        "foto_url": dados.get("foto_url") or "",
-        "peso": dados.get("peso"),
-        "altura": dados.get("altura"),
-        "idade": dados.get("idade"),
-        "cidade": dados.get("cidade") or "",
-        "estado": dados.get("estado") or "",
-        "genero": dados.get("genero") or "",
-        "data_criacao": dados.get("data_criacao") or "",
-        "bio": dados.get("bio") or "",
-        "clubes": dados.get("clubes") or [],
+        "nome": dados_db.get("nome") or "Atleta",
+        "sobrenome": dados_db.get("sobrenome") or "",
+        "foto_url": dados_db.get("foto_url") or "",
+        "peso": dados_db.get("peso"),
+        "altura": dados_db.get("altura"),
+        "idade": dados_db.get("idade"),
+        "cidade": dados_db.get("cidade") or "",
+        "estado": dados_db.get("estado") or "",
+        "genero": dados_db.get("genero") or "",
+        "data_criacao": dados_db.get("data_criacao") or "",
+        "clubes": dados_db.get("clubes") or [],
         "equipamentos": equip
     }
 
 # ==========================================
-# 🌐 ENDPOINTS (ROTAS DA API)
+# 🌐 ROTAS DA API
 # ==========================================
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor Analista de Bolso Operante 🚀"}
+    return {"status": "Motor V8 Operante 🚀", "version": "2.0.0"}
 
 @app.post("/auth/strava")
-def autenticar_strava(requisicao: StravaAuthRequest):
-    url = 'https://www.strava.com/oauth/token'
-    payload = {
-        'client_id': STRAVA_CLIENT_ID,
-        'client_secret': STRAVA_CLIENT_SECRET,
-        'code': requisicao.code,
-        'grant_type': 'authorization_code'
-    }
-    res = requests.post(url, data=payload)
-    if res.status_code != 200: raise HTTPException(status_code=400, detail="Código inválido.")
+def autenticar_usuario(requisicao: StravaAuthRequest):
+    url_token = 'https://www.strava.com/oauth/token'
+    payload = {'client_id': STRAVA_CLIENT_ID, 'client_secret': STRAVA_CLIENT_SECRET, 'code': requisicao.code, 'grant_type': 'authorization_code'}
+    res = requests.post(url_token, data=payload)
+    if res.status_code != 200: raise HTTPException(status_code=400, detail="Código OAuth inválido.")
         
-    token_payload = res.json()
-    access_token = token_payload.get('access_token')
-    atleta_resumo = token_payload.get('athlete', {})
-    atleta_id = atleta_resumo.get('id')
-    
-    headers = {'Authorization': f'Bearer {access_token}'}
-    res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
-    atleta = res_perfil.json() if res_perfil.status_code == 200 else atleta_resumo
-    
-    equip_raw = atleta.get('shoes') or []
-    bikes_raw = atleta.get('bikes') or []
-    equipamentos = {"tenis": equip_raw, "bicicletas": bikes_raw}
-    
-    clubes_raw = atleta.get('clubs') or []
-    clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in clubes_raw]
+    token_data = res.json()
+    atleta = token_data.get('athlete', {})
+    atleta_id = atleta.get('id')
     
     upsert_data = {
-        "id": atleta_id, "access_token": access_token, "refresh_token": token_payload.get('refresh_token'),
-        "nome": atleta.get('firstname'), "sobrenome": atleta.get('lastname'), "foto_url": atleta.get('profile'),
-        "peso": atleta.get('weight'), "cidade": atleta.get('city'), "estado": atleta.get('state'),
-        "genero": atleta.get('sex'), "data_criacao": atleta.get('created_at'), "bio": atleta.get('bio'),
-        "clubes": clubes, "equipamentos": equipamentos
+        "id": atleta_id,
+        "access_token": token_data.get('access_token'),
+        "refresh_token": token_data.get('refresh_token'),
+        "nome": atleta.get('firstname'),
+        "sobrenome": atleta.get('lastname'),
+        "foto_url": atleta.get('profile'),
+        "peso": atleta.get('weight'),
+        "cidade": atleta.get('city'),
+        "estado": atleta.get('state'),
+        "genero": atleta.get('sex'),
+        "data_criacao": atleta.get('created_at'),
+        "clubes": [],
+        "equipamentos": {"tenis": []}
     }
     supabase.table("usuarios_strava").upsert(upsert_data).execute()
     return {"status": "success", "strava_id": atleta_id}
 
-@app.put("/atleta/{strava_id}/biometria")
-def atualizar_biometria(strava_id: int, req: BiometriaRequest):
-    update_data = {}
-    if req.peso is not None: update_data["peso"] = req.peso
-    if req.altura is not None: update_data["altura"] = req.altura
-    if req.idade is not None: update_data["idade"] = req.idade
-        
-    if update_data:
-        res = supabase.table("usuarios_strava").update(update_data).eq("id", strava_id).execute()
-        if not res.data: raise HTTPException(status_code=404, detail="Atleta não encontrado")
-    return {"status": "success"}
-
 @app.get("/atleta/{strava_id}")
-def obter_dados_atleta(strava_id: int):
+def obter_ficha_atleta(strava_id: int):
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
-    dados = res_db.data[0]
-    historico = dados.get("historico_json") or []
-    
+    atleta = res_db.data[0]
     return {
-        "perfil": construir_perfil_seguro(dados),
-        "historico_json": historico,
-        "ia_report_json": dados.get("ia_report_json"),
-        "trofeus_json": dados.get("trofeus_json") or {}
+        "perfil": construir_perfil_seguro(atleta),
+        "historico_json": atleta.get("historico_json") or [],
+        "ia_report_json": atleta.get("ia_report_json"),
+        "trofeus_json": atleta.get("trofeus_json") or {}
     }
 
 @app.post("/atleta/{strava_id}/sincronizar")
-def sincronizar_treinos(strava_id: int):
+def sincronizar_e_atualizar(strava_id: int):
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
-    if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
-    
     atleta_db = res_db.data[0]
-    access_token = atualizar_token_strava(atleta_db['refresh_token'])
+    token_fresco = atualizar_token_strava(atleta_db['refresh_token'])
     
-    headers = {'Authorization': f'Bearer {access_token}'}
-    res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
+    # ATUALIZAÇÃO PROFUNDA: Varre 200 treinos para detectar remoção/adição da tag 'Prova'
+    url_activities = 'https://www.strava.com/api/v3/athlete/activities'
+    headers = {'Authorization': f'Bearer {token_fresco}'}
+    res_strava = requests.get(url_activities, headers=headers, params={'per_page': 200})
     
-    if res_perfil.status_code == 200:
-        s = res_perfil.json()
-        equipamentos = {"tenis": s.get('shoes') or [], "bicicletas": s.get('bikes') or []}
-        clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in (s.get('clubs') or [])]
-        
-        perfil_upd = {
-            "cidade": s.get('city'), "estado": s.get('state'),
-            "equipamentos": equipamentos, "clubes": clubes, "foto_url": s.get('profile')
-        }
-        
-        if s.get('weight'): perfil_upd["peso"] = s.get('weight')
-        supabase.table("usuarios_strava").update(perfil_upd).eq("id", strava_id).execute()
-
-    # GATILHO DE AUTOCURA: Verifica se o histórico atual está faltando os IDs ou o workout_type
+    if res_strava.status_code != 200: raise HTTPException(status_code=500)
+    
+    novos_e_editados = formatar_atividades_para_banco(res_strava.json())
     historico_antigo = atleta_db.get('historico_json') or []
-    precisa_reconstruir = False
     
-    if historico_antigo:
-        # Verifica se ALGUM treino em todo o histórico está sem a tag.
-        if any('workout_type' not in t or 'id' not in t for t in historico_antigo):
-            precisa_reconstruir = True
+    # Merge que sobrescreve treinos alterados (ex: que ganharam tag de Prova)
+    mapa_unificado = {str(t['id']): t for t in historico_antigo}
+    for treino in novos_e_editados:
+        mapa_unificado[str(treino['id'])] = treino
+        
+    lista_final = sorted(list(mapa_unificado.values()), key=lambda x: x['start_date_local'], reverse=True)
+    supabase.table("usuarios_strava").update({"historico_json": lista_final}).eq("id", strava_id).execute()
+    return {"status": "success", "historico_json": lista_final}
 
-    after_timestamp = None
+@app.post("/trofeus/garimpar/{strava_id}")
+def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
+    res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
+    usuario = res_db.data[0]
+    token = atualizar_token_strava(usuario['refresh_token'])
+    historico = usuario.get("historico_json") or []
     
-    if precisa_reconstruir:
-        historico_antigo = []
-    elif historico_antigo:
-        try:
-            data_str = historico_antigo[0].get("start_date_local")
-            dt = datetime.fromisoformat(data_str.replace("Z", "+00:00")[:19])
-            after_timestamp = int(dt.timestamp()) + 1 
-        except: pass
-            
-    treinos_novos = baixar_novos_treinos(access_token, after_timestamp)
-    todos_treinos = treinos_novos + historico_antigo if treinos_novos else historico_antigo
+    provas = [t for t in historico if t.get('workout_type') == 1]
+    if not provas:
+        return {"status": "success", "analisados": 0, "trofeus": usuario.get("trofeus_json") or {}, "msg": "Nenhuma prova oficial encontrada. Marque o evento como 'Corrida' (Race) no Strava e sincronize primeiro."}
 
-    treinos_unicos = {}
-    for t in todos_treinos:
-        data_chave = t.get('start_date_local')
-        if data_chave not in treinos_unicos:
-            treinos_unicos[data_chave] = t
-            
-    historico_atualizado = sorted(list(treinos_unicos.values()), key=lambda x: x.get('start_date_local', ''), reverse=True)
+    headers = {'Authorization': f'Bearer {token}'}
+    trofeus_atuais = usuario.get("trofeus_json") or {}
+    distancias_mapa = {"1k": "1k", "5k": "5k", "10k": "10k", "half marathon": "Half Marathon", "marathon": "Marathon"}
     
-    if treinos_novos or precisa_reconstruir or len(historico_atualizado) != len(historico_antigo):
-        supabase.table("usuarios_strava").update({"historico_json": historico_atualizado}).eq("id", strava_id).execute()
-    
-    res_final = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
-    final_db = res_final.data[0]
-
-    return {
-        "status": "success", 
-        "novos": len(treinos_novos),
-        "historico_json": historico_atualizado,
-        "perfil": construir_perfil_seguro(final_db)
-    }
+    for prova in provas:
+        res_detalhe = requests.get(f"https://www.strava.com/api/v3/activities/{prova['id']}", headers=headers)
+        if res_detalhe.status_code != 200: continue
+        
+        dados_detalhe = res_detalhe.json()
+        best_efforts = dados_detalhe.get('best_efforts', [])
+        
+        for effort in best_efforts:
+            nome_clean = effort.get('name', '').lower()
+            if nome_clean in distancias_mapa:
+                chave = distancias_mapa[nome_clean]
+                tempo_segundos = effort.get('elapsed_time')
+                
+                atual = trofeus_atuais.get(chave)
+                # A GRANDE CORREÇÃO: Atualiza o troféu se for novo, se for mais rápido, OU se já existir mas estiver sem FC!
+                if not atual or tempo_segundos < atual['tempo_segundos'] or (tempo_segundos == atual['tempo_segundos'] and ('fc_media' not in atual or atual['fc_media'] == 0)):
+                    h, m, s = int(tempo_segundos // 3600), int((tempo_segundos % 3600) // 60), int(tempo_segundos % 60)
+                    trofeus_atuais[chave] = {
+                        "tempo_segundos": tempo_segundos,
+                        "tempo_formatado": f"{h}h {m:02d}m {s:02d}s" if h > 0 else f"{m}m {s:02d}s",
+                        "nome_treino": prova['name'],
+                        "data": prova['start_date_local'],
+                        "fc_media": int(dados_detalhe.get('average_heartrate', 0)),
+                        "fc_maxima": int(dados_detalhe.get('max_heartrate', 0))
+                    }
+                    
+    supabase.table("usuarios_strava").update({"trofeus_json": trofeus_atuais}).eq("id", strava_id).execute()
+    return {"status": "success", "analisados": len(provas), "trofeus": trofeus_atuais}
 
 @app.post("/ia/analise")
-def gerar_analise_ia(requisicao: IAAnaliseRequest):
+def motor_ia_gemini(requisicao: IAAnaliseRequest):
     res_db = supabase.table("usuarios_strava").select("*").eq("id", requisicao.strava_id).execute()
-    usuario = res_db.data[0]
-    historico = usuario.get("historico_json")
-    
-    if not historico: raise HTTPException(status_code=400, detail="Sem treinos para analisar.")
+    atleta = res_db.data[0]
+    historico = atleta.get("historico_json") or []
+    if not historico: raise HTTPException(status_code=400)
 
-    historico_corridas = [t for t in historico if t.get('type', 'Run') == 'Run']
-    if not historico_corridas: raise HTTPException(status_code=400, detail="Sem corridas cadastradas para análise IA.")
-
-    idade = usuario.get('idade') or "Não informada"
-    peso = usuario.get('peso') or "Não informado"
-    genero = usuario.get('genero') or "Não informado"
-    altura_txt = f"{usuario.get('altura')}cm" if usuario.get('altura') else "Não informada"
-
-    vol_total = sum(t.get('distancia_km', 0) for t in historico_corridas)
-    treinos_total = len(historico_corridas)
-    
-    vol_30d = 0
-    bpm_soma = 0
-    treinos_30d = 0
-    treinos_30_dias_brutos = []
-    limite_30d = datetime.now() - timedelta(days=30)
-    
-    for t in historico_corridas:
-        try:
-            dt = datetime.fromisoformat(t.get("start_date_local").replace("Z", "+00:00")[:19])
-            if dt >= limite_30d:
-                vol_30d += t.get("distancia_km", 0)
-                bpm_soma += t.get("average_heartrate", 0)
-                treinos_30d += 1
-                treinos_30_dias_brutos.append(t)
-        except: pass
-                
-    bpm_med_30d = int(bpm_soma / treinos_30d) if treinos_30d > 0 else 0
-    if not treinos_30_dias_brutos: treinos_30_dias_brutos = historico_corridas[:3]
-
-    resumo_treinos = []
-    for t in treinos_30_dias_brutos:
-        linha = f"[{t.get('start_date_local', '')[:10]}] {round(t.get('distancia_km', 0), 1)}km | Pace: {t.get('Pace_Medio', '00:00')} | BPM: {int(t.get('average_heartrate', 0))} | SPM: {int(t.get('Cadence_SPM', 0))}"
-        resumo_treinos.append(linha)
-        
-    payload_para_ia = "\n".join(resumo_treinos)
-    
-    prompt = f"""
-    Atue como um Fisiologista do Esporte e Treinador de Corrida de Elite.
-    📋 PERFIL DO ATLETA:
-    - Nome: {usuario.get('nome')} | Idade: {idade} | Sexo: {genero} | Peso: {peso}kg | Altura: {altura_txt}
-    
-    📊 CARGA CRÔNICA: {treinos_total} treinos | {round(vol_total, 1)} km
-    📈 ÚLTIMOS 30 DIAS: {round(vol_30d, 1)} km | {bpm_med_30d} BPM médio
-    
-    👟 TELEMETRIA TÁTICA:
-    {payload_para_ia}
-    
-    Analise biomecânica e cardíaca profunda (Jack Daniels/Joe Friel).
-    Retorne JSON: "diagnostico_geral" (4 linhas), "ponto_de_melhoria" (Insight prático), "nota_eficiencia" (0-10).
-    """
+    resumo_treinos = [f"[{t['start_date_local'][:10]}] {round(t['distancia_km'], 1)}km | Pace: {t['Pace_Medio']} | BPM: {int(t['average_heartrate'])}" for t in historico[:12]]
+    prompt = f"Analise o atleta {atleta['nome']}, {atleta.get('idade')} anos, {atleta.get('peso')}kg. \n{chr(10).join(resumo_treinos)}\nRetorne JSON: diagnostico_geral, ponto_de_melhoria, nota_eficiencia (0-10)."
     
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
-        res_ia = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        texto_limpo = res_ia.text.strip().replace('```json', '').replace('```', '').strip()
-        analise = json.loads(texto_limpo)
-        supabase.table("usuarios_strava").update({"ia_report_json": analise}).eq("id", requisicao.strava_id).execute()
-        return analise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro interno de IA: {str(e)}")
-
-# ==========================================
-# NOVO MÓDULO: O ALGORITMO GARIMPEIRO (SALA DE TROFÉUS)
-# ==========================================
-@app.post("/trofeus/garimpar/{strava_id}")
-def garimpar_trofeus(strava_id: int, req: TrofeusRequest):
-    res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
-    if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
-    
-    usuario = res_db.data[0]
-    
-    try:
-        access_token = atualizar_token_strava(usuario['refresh_token'])
+        response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt, config=types.GenerateContentConfig(response_mime_type="application/json"))
+        resultado = json.loads(response.text)
+        supabase.table("usuarios_strava").update({"ia_report_json": resultado}).eq("id", requisicao.strava_id).execute()
+        return resultado
     except Exception:
-        raise HTTPException(status_code=401, detail="Falha ao renovar token. Faça login novamente.")
+        raise HTTPException(status_code=500)
 
-    historico = usuario.get("historico_json") or []
-    corridas = [t for t in historico if t.get('type') == 'Run' and t.get('id') is not None]
-    
-    # REFORÇO DE ARQUITETURA: Pesquisa cravada exclusivamente em Provas Oficiais.
-    alvos = [t for t in corridas if t.get('workout_type') == 1]
-        
-    if not alvos:
-        return {
-            "status": "success", 
-            "analisados": 0, 
-            "trofeus": usuario.get("trofeus_json") or {}, 
-            "msg": "Nenhuma Prova encontrada no banco. DICA: Verifique se marcou seus recordes como 'Prova' no Strava e clique em 'Sincronizar Novos Dados'."
-        }
-
-    headers = {'Authorization': f'Bearer {access_token}'}
-    trofeus = usuario.get("trofeus_json") or {}
-    
-    # Mapeamento blindado contra variações de maiúsculas/minúsculas do Strava API (ex: 5K vs 5k)
-    mapa_distancias = {
-        "1k": "1k",
-        "5k": "5k",
-        "10k": "10k",
-        "half marathon": "Half Marathon",
-        "marathon": "Marathon"
-    }
-    
-    for dist in mapa_distancias.values():
-        if dist not in trofeus:
-            trofeus[dist] = None
-            
-    for treino in alvos:
-        act_id = treino.get('id')
-        res = requests.get(f'https://www.strava.com/api/v3/activities/{act_id}', headers=headers)
-        if res.status_code != 200: continue
-        
-        detalhes = res.json()
-        best_efforts = detalhes.get('best_efforts') or []
-        
-        for effort in best_efforts:
-            nome_esforco_raw = effort.get('name', '')
-            nome_esforco_lower = nome_esforco_raw.lower()
-            
-            # Match perfeito: converte "5K" do Strava para "5k" e cruza com o nosso dicionário
-            if nome_esforco_lower in mapa_distancias:
-                chave_frontend = mapa_distancias[nome_esforco_lower]
-                tempo_atual = effort.get('elapsed_time')
-                
-                if trofeus[chave_frontend] is None or tempo_atual < trofeus[chave_frontend]['tempo_segundos']:
-                    h = int(tempo_atual // 3600)
-                    m = int((tempo_atual % 3600) // 60)
-                    s = int(tempo_atual % 60)
-                    
-                    if h > 0:
-                        tempo_formatado = f"{h}h {m:02d}m {s:02d}s"
-                    else:
-                        tempo_formatado = f"{m}m {s:02d}s"
-
-                    trofeus[chave_frontend] = {
-                        "tempo_segundos": tempo_atual,
-                        "tempo_formatado": tempo_formatado,
-                        "nome_treino": treino.get('name'),
-                        "data": treino.get('start_date_local'),
-                        "id_treino": act_id
-                    }
-                    
-    supabase.table("usuarios_strava").update({"trofeus_json": trofeus}).eq("id", strava_id).execute()
-    
-    return {
-        "status": "success",
-        "analisados": len(alvos),
-        "trofeus": trofeus
-    }
+@app.put("/atleta/{strava_id}/biometria")
+def atualizar_biometria(strava_id: int, req: BiometriaRequest):
+    upd = {k: v for k, v in req.dict().items() if v is not None}
+    if upd: supabase.table("usuarios_strava").update(upd).eq("id", strava_id).execute()
+    return {"status": "success"}
