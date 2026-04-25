@@ -13,7 +13,7 @@ from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 2.0.0 - Blindagem Total & Detecção Profunda
+# Versão: 2.1.0 - Varredura Absoluta & Expurgador de Fantasmas
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -80,7 +80,6 @@ def formatar_atividades_para_banco(lista_bruta):
         
     df['Pace_Medio'] = df.apply(calc_pace_mm_ss, axis=1)
     
-    # Extração robusta das telemetrias
     df['average_heartrate'] = df['average_heartrate'].fillna(0) if 'average_heartrate' in df.columns else 0
     df['max_heartrate'] = df['max_heartrate'].fillna(0) if 'max_heartrate' in df.columns else 0
     df['Cadence_SPM'] = df['average_cadence'] * 2 if 'average_cadence' in df.columns else 0
@@ -91,7 +90,6 @@ def formatar_atividades_para_banco(lista_bruta):
     return json.loads(res_json)
 
 def construir_perfil_seguro(dados_db: dict) -> dict:
-    """O Guardião do Frontend: Garante que os dados enviados ao React sejam inquebráveis."""
     equip = dados_db.get("equipamentos")
     if not isinstance(equip, dict):
         equip = {"tenis": [], "bicicletas": []}
@@ -117,7 +115,7 @@ def construir_perfil_seguro(dados_db: dict) -> dict:
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "2.0.0"}
+    return {"status": "Motor V8 Operante 🚀", "version": "2.1.0"}
 
 @app.post("/auth/strava")
 def autenticar_usuario(requisicao: StravaAuthRequest):
@@ -167,22 +165,29 @@ def sincronizar_e_atualizar(strava_id: int):
     atleta_db = res_db.data[0]
     token_fresco = atualizar_token_strava(atleta_db['refresh_token'])
     
-    # ATUALIZAÇÃO PROFUNDA: Varre 200 treinos para detectar remoção/adição da tag 'Prova'
     url_activities = 'https://www.strava.com/api/v3/athlete/activities'
     headers = {'Authorization': f'Bearer {token_fresco}'}
-    res_strava = requests.get(url_activities, headers=headers, params={'per_page': 200})
     
-    if res_strava.status_code != 200: raise HTTPException(status_code=500)
-    
-    novos_e_editados = formatar_atividades_para_banco(res_strava.json())
-    historico_antigo = atleta_db.get('historico_json') or []
-    
-    # Merge que sobrescreve treinos alterados (ex: que ganharam tag de Prova)
-    mapa_unificado = {str(t['id']): t for t in historico_antigo}
-    for treino in novos_e_editados:
-        mapa_unificado[str(treino['id'])] = treino
+    # A SOLUÇÃO: VARREDURA ABSOLUTA. Baixamos todas as páginas até o final.
+    # Garante que qualquer remoção, edição de nome ou tag no Strava seja 100% espelhada.
+    treinos_brutos = []
+    pagina = 1
+    while True:
+        res_strava = requests.get(url_activities, headers=headers, params={'per_page': 200, 'page': pagina})
+        if res_strava.status_code != 200: raise HTTPException(status_code=500, detail="Falha na API Strava.")
         
-    lista_final = sorted(list(mapa_unificado.values()), key=lambda x: x['start_date_local'], reverse=True)
+        dados = res_strava.json()
+        if not dados: break # Se vier vazio, chegamos ao fim da vida do atleta
+        
+        treinos_brutos.extend(dados)
+        
+        # Se vieram menos que 200, é porque não há próxima página
+        if len(dados) < 200: break
+        pagina += 1
+        
+    lista_final = formatar_atividades_para_banco(treinos_brutos)
+    
+    # SUBSTITUIÇÃO TOTAL: Não fazemos mais "merge". Sobrescrevemos tudo.
     supabase.table("usuarios_strava").update({"historico_json": lista_final}).eq("id", strava_id).execute()
     return {"status": "success", "historico_json": lista_final}
 
@@ -194,12 +199,18 @@ def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
     historico = usuario.get("historico_json") or []
     
     provas = [t for t in historico if t.get('workout_type') == 1]
+    
+    # Se ele desmarcou todas as provas, apagamos os troféus no banco de dados para não ficar fantasma.
     if not provas:
-        return {"status": "success", "analisados": 0, "trofeus": usuario.get("trofeus_json") or {}, "msg": "Nenhuma prova oficial encontrada. Mude a tag da atividade no Strava para 'Corrida' (Race) e sincronize novamente."}
+        supabase.table("usuarios_strava").update({"trofeus_json": {}}).eq("id", strava_id).execute()
+        return {"status": "success", "analisados": 0, "trofeus": {}, "msg": "Nenhuma prova oficial encontrada. A sua Sala de Troféus foi limpa."}
 
     headers = {'Authorization': f'Bearer {token}'}
-    trofeus_atuais = usuario.get("trofeus_json") or {}
     distancias_mapa = {"1k": "1k", "5k": "5k", "10k": "10k", "half marathon": "Half Marathon", "marathon": "Marathon"}
+    
+    # A SOLUÇÃO DOS FANTASMAS: Começamos com uma gaveta VAZIA.
+    # Em vez de tentar "atualizar" o antigo, nós reconstruímos do zero a cada clique.
+    trofeus_renovados = {} 
     
     for prova in provas:
         res_detalhe = requests.get(f"https://www.strava.com/api/v3/activities/{prova['id']}", headers=headers)
@@ -214,11 +225,12 @@ def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
                 chave = distancias_mapa[nome_clean]
                 tempo_segundos = effort.get('elapsed_time')
                 
-                atual = trofeus_atuais.get(chave)
-                # Atualiza o troféu se for novo, se for mais rápido, OU se já existir mas estiver sem FC (Correção de Bug)
-                if not atual or tempo_segundos < atual['tempo_segundos'] or (tempo_segundos == atual['tempo_segundos'] and ('fc_media' not in atual or atual['fc_media'] == 0)):
+                atual = trofeus_renovados.get(chave)
+                
+                # Regra: Só guarda se for a primeira vez que acha a distância, ou se for mais rápido.
+                if not atual or tempo_segundos < atual['tempo_segundos']:
                     h, m, s = int(tempo_segundos // 3600), int((tempo_segundos % 3600) // 60), int(tempo_segundos % 60)
-                    trofeus_atuais[chave] = {
+                    trofeus_renovados[chave] = {
                         "tempo_segundos": tempo_segundos,
                         "tempo_formatado": f"{h}h {m:02d}m {s:02d}s" if h > 0 else f"{m}m {s:02d}s",
                         "nome_treino": prova['name'],
@@ -227,8 +239,9 @@ def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
                         "fc_maxima": int(dados_detalhe.get('max_heartrate', 0))
                     }
                     
-    supabase.table("usuarios_strava").update({"trofeus_json": trofeus_atuais}).eq("id", strava_id).execute()
-    return {"status": "success", "analisados": len(provas), "trofeus": trofeus_atuais}
+    # Salva a nova gaveta no banco de dados, substituindo a velha
+    supabase.table("usuarios_strava").update({"trofeus_json": trofeus_renovados}).eq("id", strava_id).execute()
+    return {"status": "success", "analisados": len(provas), "trofeus": trofeus_renovados}
 
 @app.post("/ia/analise")
 def motor_ia_gemini(requisicao: IAAnaliseRequest):
@@ -237,7 +250,6 @@ def motor_ia_gemini(requisicao: IAAnaliseRequest):
     historico = atleta.get("historico_json") or []
     if not historico: raise HTTPException(status_code=400, detail="Sem treinos para analisar.")
 
-    # Extrai os últimos 12 treinos
     resumo_treinos = [f"[{t['start_date_local'][:10]}] {round(t['distancia_km'], 1)}km | Pace: {t['Pace_Medio']} | BPM: {int(t['average_heartrate'])}" for t in historico[:12]]
     prompt = f"Analise o atleta {atleta['nome']}, {atleta.get('idade')} anos, {atleta.get('peso')}kg. \n{chr(10).join(resumo_treinos)}\nRetorne JSON: diagnostico_geral, ponto_de_melhoria, nota_eficiencia (0-10)."
     
