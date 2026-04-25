@@ -225,7 +225,7 @@ def atualizar_biometria(strava_id: int, req: BiometriaRequest):
     """Nova Rota: Atualiza Peso e Altura manualmente no Supabase"""
     res = supabase.table("usuarios_strava").update({
         "peso": req.peso,
-        "altura": req.altura
+        "altura": req.altura,
         "idade": req.idade
     }).eq("id", strava_id).execute()
     
