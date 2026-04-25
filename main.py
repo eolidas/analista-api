@@ -72,10 +72,7 @@ def atualizar_token_strava(refresh_token: str) -> str:
     raise HTTPException(status_code=401, detail="Falha ao renovar token do Strava")
 
 def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
-    """
-    Sincronização Unificada: Extrai sempre Corridas e Caminhadas.
-    A filtragem de exibição ocorrerá nativamente no Frontend (Client-side).
-    """
+    """Sincronização Unificada: Extrai sempre Corridas e Caminhadas."""
     url = 'https://www.strava.com/api/v3/athlete/activities'
     headers = {'Authorization': f'Bearer {access_token}'}
     
@@ -103,9 +100,7 @@ def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
     df_bruto = pd.DataFrame(atividades_totais)
     if 'type' not in df_bruto.columns: return []
         
-    # FILTRO MESTRE: Coleta tanto as Corridas quanto as Caminhadas
     df_atividades = df_bruto[df_bruto['type'].isin(['Run', 'Walk'])].copy()
-    
     if df_atividades.empty: return []
         
     df_atividades['distancia_km'] = df_atividades['distance'] / 1000.0
@@ -123,14 +118,13 @@ def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
     df_atividades['start_date_local'] = pd.to_datetime(df_atividades['start_date_local'])
     df_atividades = df_atividades.sort_values(by='start_date_local', ascending=False).reset_index(drop=True)
 
-    # Adicionado a coluna 'type' para o Frontend saber o que é Run e Walk
     colunas = ['type', 'name', 'distancia_km', 'Pace_Medio', 'Cadence_SPM', 'average_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local']
     
     json_string = df_atividades[colunas].to_json(orient='records', force_ascii=False, date_format='iso')
     return json.loads(json_string)
 
 def calcular_estatisticas(historico: list) -> dict:
-    """Calculadora Backend de Volume (Mantida como redundância de API)."""
+    """Calculadora Backend de Volume (Mantida como redundância)."""
     if not historico:
         return {"totalDist": 0, "totalWorkouts": 0, "monthVolume": 0, "weekVolume": 0}
 
@@ -196,8 +190,13 @@ def autenticar_strava(requisicao: StravaAuthRequest):
     res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
     atleta = res_perfil.json() if res_perfil.status_code == 200 else atleta_resumo
     
-    equipamentos = {"tenis": atleta.get('shoes', []), "bicicletas": atleta.get('bikes', [])}
-    clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in atleta.get('clubs', [])]
+    # BLINDAGEM CONTRA VALORES NULOS NO STRAVA API
+    equip_raw = atleta.get('shoes') or []
+    bikes_raw = atleta.get('bikes') or []
+    equipamentos = {"tenis": equip_raw, "bicicletas": bikes_raw}
+    
+    clubes_raw = atleta.get('clubs') or []
+    clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in clubes_raw]
     
     upsert_data = {
         "id": atleta_id, "access_token": access_token, "refresh_token": token_payload.get('refresh_token'),
@@ -223,18 +222,22 @@ def atualizar_biometria(strava_id: int, req: BiometriaRequest):
 
 @app.get("/atleta/{strava_id}")
 def obter_dados_atleta(strava_id: int):
+    """FONTE DA VERDADE: Formata rigorosamente os dados para evitar que o React feche."""
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
     dados = res_db.data[0]
     historico = dados.get("historico_json") or []
+    
+    # BLINDAGEM DO PERFIL: Garante que dicionários e listas não chegam nulos no Frontend
     return {
         "perfil": {
             "nome": dados.get("nome"), "sobrenome": dados.get("sobrenome"), "foto_url": dados.get("foto_url"),
             "peso": dados.get("peso"), "altura": dados.get("altura"), "idade": dados.get("idade"),
             "cidade": dados.get("cidade"), "estado": dados.get("estado"), "genero": dados.get("genero"),
             "data_criacao": dados.get("data_criacao"), "bio": dados.get("bio"),
-            "clubes": dados.get("clubes"), "equipamentos": dados.get("equipamentos")
+            "clubes": dados.get("clubes") or [],
+            "equipamentos": dados.get("equipamentos") or {"tenis": [], "bicicletas": []}
         },
         "estatisticas": calcular_estatisticas(historico),
         "historico_json": historico,
@@ -243,7 +246,7 @@ def obter_dados_atleta(strava_id: int):
 
 @app.post("/atleta/{strava_id}/sincronizar")
 def sincronizar_treinos(strava_id: int):
-    """SINCRONIZAÇÃO INTELIGENTE (LIMPA E DIRETA). O Backend extrai sempre Run e Walk."""
+    """SINCRONIZAÇÃO INTELIGENTE COM PROTEÇÃO CONTRA CRASHES NO REACT."""
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
@@ -256,24 +259,27 @@ def sincronizar_treinos(strava_id: int):
     
     if res_perfil.status_code == 200:
         s = res_perfil.json()
-        equipamentos = {"tenis": s.get('shoes', []), "bicicletas": s.get('bikes', [])}
-        clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in s.get('clubs', [])]
+        
+        # BLINDAGEM CONTRA VALORES NULOS NO STRAVA API
+        equip_raw = s.get('shoes') or []
+        bikes_raw = s.get('bikes') or []
+        equipamentos = {"tenis": equip_raw, "bicicletas": bikes_raw}
+        
+        clubes_raw = s.get('clubs') or []
+        clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in clubes_raw]
         
         perfil_upd = {
             "cidade": s.get('city'), "estado": s.get('state'),
             "equipamentos": equipamentos, "clubes": clubes, "foto_url": s.get('profile')
         }
         
-        # PROTEÇÃO DE DADOS: Só atualiza o peso vindo do Strava se ele existir. 
-        # Isso impede que o Strava apague o peso inserido manualmente caso devolva null.
         peso_strava = s.get('weight')
         if peso_strava:
             perfil_upd["peso"] = peso_strava
             
         supabase.table("usuarios_strava").update(perfil_upd).eq("id", strava_id).execute()
 
-    # FORMATADOR ESTILIZADO: Sempre devolve o perfil limpo e exato para o Frontend.
-    # Isso evita enviar a tabela inteira (com os históricos pesados) e bugar o React.
+    # FORMATADOR ESTILIZADO: Sempre devolve o perfil limpo com a mesma blindagem da rota GET
     res_full = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     dados = res_full.data[0]
     perfil_final = {
@@ -288,11 +294,11 @@ def sincronizar_treinos(strava_id: int):
         "genero": dados.get("genero"),
         "data_criacao": dados.get("data_criacao"),
         "bio": dados.get("bio"),
-        "clubes": dados.get("clubes"),
-        "equipamentos": dados.get("equipamentos")
+        "clubes": dados.get("clubes") or [],
+        "equipamentos": dados.get("equipamentos") or {"tenis": [], "bicicletas": []}
     }
 
-    # 2. Sync de Treinos (Apenas Delta Clássico)
+    # 2. Sync de Treinos e Deduplicação
     historico_antigo = atleta_db.get('historico_json') or []
     after_timestamp = None
     
@@ -305,7 +311,6 @@ def sincronizar_treinos(strava_id: int):
     treinos_novos = baixar_novos_treinos(access_token, after_timestamp)
     todos_treinos = treinos_novos + historico_antigo if treinos_novos else historico_antigo
 
-    # 3. Deduplicação
     treinos_unicos = {}
     for t in todos_treinos:
         data_chave = t.get('start_date_local')
