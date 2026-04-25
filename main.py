@@ -16,14 +16,13 @@ from supabase import create_client, Client
 # Missão: Sincronização Inteligente & Fonte da Verdade
 # ==========================================
 
-# Carregamento das variáveis de ambiente (Configuradas no Render)
+# Carregamento das variáveis de ambiente
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
 STRAVA_CLIENT_SECRET = os.getenv("STRAVA_CLIENT_SECRET")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Inicialização do Cliente Supabase
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 except Exception as e:
@@ -31,7 +30,6 @@ except Exception as e:
 
 app = FastAPI(title="API Analista de Bolso")
 
-# Configuração de CORS para permitir que a Vercel aceda ao motor
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,8 +37,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# --- MODELOS DE DADOS (Pydantic) ---
 
 class StravaAuthRequest(BaseModel):
     code: str
@@ -61,7 +57,6 @@ class TrofeusRequest(BaseModel):
 # ==========================================
 
 def atualizar_token_strava(refresh_token: str) -> str:
-    """Renova o access_token expirado."""
     url = 'https://www.strava.com/oauth/token'
     payload = {
         'client_id': STRAVA_CLIENT_ID,
@@ -75,7 +70,6 @@ def atualizar_token_strava(refresh_token: str) -> str:
     raise HTTPException(status_code=401, detail="Falha ao renovar token do Strava")
 
 def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
-    """Sincronização Unificada: Extrai sempre Corridas e Caminhadas com ID e Workout Type."""
     url = 'https://www.strava.com/api/v3/athlete/activities'
     headers = {'Authorization': f'Bearer {access_token}'}
     
@@ -103,18 +97,17 @@ def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
     df_bruto = pd.DataFrame(atividades_totais)
     if 'type' not in df_bruto.columns: return []
         
-    # FILTRO MESTRE: Coleta tanto as Corridas quanto as Caminhadas
     df_atividades = df_bruto[df_bruto['type'].isin(['Run', 'Walk'])].copy()
     
     if df_atividades.empty: return []
         
     df_atividades['distancia_km'] = df_atividades['distance'] / 1000.0
     
-    # Tratamento para ausência do workout_type (Padrão 0 = Corrida Comum, 1 = Prova)
+    # Tratamento Seguro do workout_type (Padrão 0 = Comum, 1 = Prova)
     if 'workout_type' not in df_atividades.columns:
         df_atividades['workout_type'] = 0
     else:
-        df_atividades['workout_type'] = df_atividades['workout_type'].fillna(0)
+        df_atividades['workout_type'] = df_atividades['workout_type'].fillna(0).astype(int)
     
     def formatar_pace(linha):
         if linha['distancia_km'] == 0: return "00:00"
@@ -129,14 +122,12 @@ def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
     df_atividades['start_date_local'] = pd.to_datetime(df_atividades['start_date_local'])
     df_atividades = df_atividades.sort_values(by='start_date_local', ascending=False).reset_index(drop=True)
 
-    # Inclusão do ID e workout_type para o Algoritmo Garimpeiro
     colunas = ['id', 'type', 'workout_type', 'name', 'distancia_km', 'Pace_Medio', 'Cadence_SPM', 'average_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local']
     
     json_string = df_atividades[colunas].to_json(orient='records', force_ascii=False, date_format='iso')
     return json.loads(json_string)
 
 def construir_perfil_seguro(dados: dict) -> dict:
-    """Garante que o objeto de perfil nunca tenha campos nulos fatais para o React."""
     equip = dados.get("equipamentos")
     if not isinstance(equip, dict):
         equip = {"tenis": [], "bicicletas": []}
@@ -217,7 +208,6 @@ def atualizar_biometria(strava_id: int, req: BiometriaRequest):
 
 @app.get("/atleta/{strava_id}")
 def obter_dados_atleta(strava_id: int):
-    """FONTE DA VERDADE: Formata rigorosamente os dados e inclui a Sala de Troféus."""
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
@@ -233,7 +223,6 @@ def obter_dados_atleta(strava_id: int):
 
 @app.post("/atleta/{strava_id}/sincronizar")
 def sincronizar_treinos(strava_id: int):
-    """SINCRONIZAÇÃO: Padronização total de chaves com a rota GET."""
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
@@ -256,10 +245,21 @@ def sincronizar_treinos(strava_id: int):
         if s.get('weight'): perfil_upd["peso"] = s.get('weight')
         supabase.table("usuarios_strava").update(perfil_upd).eq("id", strava_id).execute()
 
-    # 2. Sync de Treinos e Deduplicação
+    # GATILHO DE AUTOCURA: Verifica se o histórico atual está faltando os IDs ou o workout_type
     historico_antigo = atleta_db.get('historico_json') or []
-    after_timestamp = None
+    precisa_reconstruir = False
+    
     if historico_antigo:
+        primeiro_treino = historico_antigo[0]
+        if 'id' not in primeiro_treino or 'workout_type' not in primeiro_treino:
+            precisa_reconstruir = True
+
+    after_timestamp = None
+    
+    if precisa_reconstruir:
+        # Esvazia a memória local para o algoritmo puxar TUDO do Strava do zero, com as novas colunas
+        historico_antigo = []
+    elif historico_antigo:
         try:
             data_str = historico_antigo[0].get("start_date_local")
             dt = datetime.fromisoformat(data_str.replace("Z", "+00:00")[:19])
@@ -277,10 +277,9 @@ def sincronizar_treinos(strava_id: int):
             
     historico_atualizado = sorted(list(treinos_unicos.values()), key=lambda x: x.get('start_date_local', ''), reverse=True)
     
-    if treinos_novos or len(historico_atualizado) != len(historico_antigo):
+    if treinos_novos or precisa_reconstruir or len(historico_atualizado) != len(historico_antigo):
         supabase.table("usuarios_strava").update({"historico_json": historico_atualizado}).eq("id", strava_id).execute()
     
-    # BUSCA FINAL: Garante que devolvemos o objeto completo e seguro
     res_final = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     final_db = res_final.data[0]
 
@@ -293,17 +292,12 @@ def sincronizar_treinos(strava_id: int):
 
 @app.post("/ia/analise")
 def gerar_analise_ia(requisicao: IAAnaliseRequest):
-    """
-    Motor Blindado: IA analisa apenas Corridas, com compressão de dados
-    para economizar tokens e evitar estouro de limite.
-    """
     res_db = supabase.table("usuarios_strava").select("*").eq("id", requisicao.strava_id).execute()
     usuario = res_db.data[0]
     historico = usuario.get("historico_json")
     
     if not historico: raise HTTPException(status_code=400, detail="Sem treinos para analisar.")
 
-    # Filtramos apenas atividades que sejam corridas para a IA
     historico_corridas = [t for t in historico if t.get('type', 'Run') == 'Run']
     if not historico_corridas: raise HTTPException(status_code=400, detail="Sem corridas cadastradas para análise IA.")
 
@@ -334,7 +328,6 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
     bpm_med_30d = int(bpm_soma / treinos_30d) if treinos_30d > 0 else 0
     if not treinos_30_dias_brutos: treinos_30_dias_brutos = historico_corridas[:3]
 
-    # === COMPRESSÃO DE DADOS PARA ECONOMIA DE TOKENS ===
     resumo_treinos = []
     for t in treinos_30_dias_brutos:
         linha = f"[{t.get('start_date_local', '')[:10]}] {round(t.get('distancia_km', 0), 1)}km | Pace: {t.get('Pace_Medio', '00:00')} | BPM: {int(t.get('average_heartrate', 0))} | SPM: {int(t.get('Cadence_SPM', 0))}"
@@ -388,29 +381,30 @@ def garimpar_trofeus(strava_id: int, req: TrofeusRequest):
 
     historico = usuario.get("historico_json") or []
     
-    # 1. Filtramos apenas as corridas que possuem ID (necessário para a API Detalhada)
     corridas = [t for t in historico if t.get('type') == 'Run' and t.get('id') is not None]
     
-    # 2. O funil da economia de API
     if req.somente_provas:
         alvos = [t for t in corridas if t.get('workout_type') == 1]
     else:
-        # Pega as 20 corridas mais longas do atleta (maior chance de conter os RPs)
         alvos = sorted(corridas, key=lambda x: x.get('distancia_km', 0), reverse=True)[:20]
         
+    # Devolve o número 0 para "analisados" caso a lista esteja vazia, para não quebrar o Frontend
     if not alvos:
-        return {"status": "success", "trofeus": usuario.get("trofeus_json") or {}, "msg": "Nenhum treino alvo encontrado para análise."}
+        return {
+            "status": "success", 
+            "analisados": 0, 
+            "trofeus": usuario.get("trofeus_json") or {}, 
+            "msg": "Nenhuma Prova encontrada no banco. DICA: Faça uma nova sincronização do histórico para puxar as etiquetas oficiais do Strava."
+        }
 
     headers = {'Authorization': f'Bearer {access_token}'}
     
-    # 3. Mantém os recordes antigos para não zerar se o filtro não os encontrar hoje
     trofeus = usuario.get("trofeus_json") or {}
     distancias_alvo = ["1k", "5k", "10k", "Half Marathon", "Marathon"]
     for dist in distancias_alvo:
         if dist not in trofeus:
             trofeus[dist] = None
             
-    # 4. A caça aos Recordes Pessoais (Sniper API Calls)
     for treino in alvos:
         act_id = treino.get('id')
         res = requests.get(f'https://www.strava.com/api/v3/activities/{act_id}', headers=headers)
@@ -424,10 +418,7 @@ def garimpar_trofeus(strava_id: int, req: TrofeusRequest):
             if nome_esforco in distancias_alvo:
                 tempo_atual = effort.get('elapsed_time')
                 
-                # Se ainda não tem recorde, ou se o tempo atual for MENOR que o recorde antigo
                 if trofeus[nome_esforco] is None or tempo_atual < trofeus[nome_esforco]['tempo_segundos']:
-                    
-                    # Converte o tempo bruto em segundos para o formato de pódio (Ex: 1h 45m 30s)
                     h = int(tempo_atual // 3600)
                     m = int((tempo_atual % 3600) // 60)
                     s = int(tempo_atual % 60)
@@ -445,7 +436,6 @@ def garimpar_trofeus(strava_id: int, req: TrofeusRequest):
                         "id_treino": act_id
                     }
                     
-    # 5. Salva na Ficha do Atleta
     supabase.table("usuarios_strava").update({"trofeus_json": trofeus}).eq("id", strava_id).execute()
     
     return {
