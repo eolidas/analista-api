@@ -45,6 +45,10 @@ class StravaAuthRequest(BaseModel):
 class IAAnaliseRequest(BaseModel):
     strava_id: int
 
+class BiometriaRequest(BaseModel):
+    peso: float
+    altura: float
+
 # ==========================================
 # ⚙️ FUNÇÕES AUXILIARES & REGRAS DE NEGÓCIO
 # ==========================================
@@ -102,7 +106,7 @@ def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
     df_corridas['start_date_local'] = pd.to_datetime(df_corridas['start_date_local'])
     df_corridas = df_corridas.sort_values(by='start_date_local', ascending=False).reset_index(drop=True)
 
-    colunas = ['name', 'distancia_km', 'Pace_Medio', 'Cadence_SPM', 'average_heartrate', 'total_elevation_gain', 'start_date_local']
+    colunas = ['name', 'distancia_km', 'Pace_Medio', 'Cadence_SPM', 'average_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local']
     
     json_string = df_corridas[colunas].to_json(orient='records', force_ascii=False, date_format='iso')
     return json.loads(json_string)
@@ -164,7 +168,7 @@ def health_check():
 
 @app.post("/auth/strava")
 def autenticar_strava(requisicao: StravaAuthRequest):
-    """Realiza a troca do code pelos tokens e guarda o utilizador no banco."""
+    # 1. Troca o código pelo Token
     url = 'https://www.strava.com/oauth/token'
     payload = {
         'client_id': STRAVA_CLIENT_ID,
@@ -177,27 +181,60 @@ def autenticar_strava(requisicao: StravaAuthRequest):
     if res.status_code != 200: raise HTTPException(status_code=400, detail="Código inválido.")
         
     token_payload = res.json()
-    atleta = token_payload.get('athlete', {})
-    atleta_id = atleta.get('id')
+    access_token = token_payload.get('access_token')
+    atleta_resumo = token_payload.get('athlete', {})
+    atleta_id = atleta_resumo.get('id')
+    
+    # 2. PULO DO GATO: Busca o Perfil Detalhado no Strava
+    headers = {'Authorization': f'Bearer {access_token}'}
+    res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
+    
+    atleta = res_perfil.json() if res_perfil.status_code == 200 else atleta_resumo
+    
+    equipamentos = {
+        "tenis": atleta.get('shoes', []),
+        "bicicletas": atleta.get('bikes', [])
+    }
+    
+    # Extração de Clubes
+    clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in atleta.get('clubs', [])]
     
     upsert_data = {
         "id": atleta_id,
-        "access_token": token_payload.get('access_token'),
+        "access_token": access_token,
         "refresh_token": token_payload.get('refresh_token'),
         "nome": atleta.get('firstname'),
         "sobrenome": atleta.get('lastname'),
-        "foto_url": atleta.get('profile')
+        "foto_url": atleta.get('profile'),
+        "peso": atleta.get('weight'),
+        "cidade": atleta.get('city'),
+        "estado": atleta.get('state'),
+        "genero": atleta.get('sex'),
+        "data_criacao": atleta.get('created_at'),
+        "bio": atleta.get('bio'),
+        "clubes": clubes,
+        "equipamentos": equipamentos
     }
     supabase.table("usuarios_strava").upsert(upsert_data).execute()
         
     return {"status": "success", "strava_id": atleta_id}
 
+@app.put("/atleta/{strava_id}/biometria")
+def atualizar_biometria(strava_id: int, req: BiometriaRequest):
+    """Nova Rota: Atualiza Peso e Altura manualmente no Supabase"""
+    res = supabase.table("usuarios_strava").update({
+        "peso": req.peso,
+        "altura": req.altura
+    }).eq("id", strava_id).execute()
+    
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Atleta não encontrado")
+    return {"status": "success"}
+
 @app.get("/atleta/{strava_id}")
 def obter_dados_atleta(strava_id: int):
-    """
-    FONTE DA VERDADE: Entrega Perfil, Estatísticas Calculadas e Histórico JSON.
-    """
-    res_db = supabase.table("usuarios_strava").select("nome, foto_url, peso, idade, historico_json, ia_report_json").eq("id", strava_id).execute()
+    """FONTE DA VERDADE: Entrega Perfil, Estatísticas Calculadas e Histórico."""
+    res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     if not res_db.data:
         raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
@@ -208,9 +245,18 @@ def obter_dados_atleta(strava_id: int):
     return {
         "perfil": {
             "nome": dados.get("nome"),
+            "sobrenome": dados.get("sobrenome"),
             "foto_url": dados.get("foto_url"),
             "peso": dados.get("peso"),
-            "idade": dados.get("idade")
+            "altura": dados.get("altura"),
+            "idade": dados.get("idade"),
+            "cidade": dados.get("cidade"),
+            "estado": dados.get("estado"),
+            "genero": dados.get("genero"),
+            "data_criacao": dados.get("data_criacao"),
+            "bio": dados.get("bio"),
+            "clubes": dados.get("clubes"),
+            "equipamentos": dados.get("equipamentos")
         },
         "estatisticas": estatisticas,
         "historico_json": historico,
@@ -219,18 +265,15 @@ def obter_dados_atleta(strava_id: int):
 
 @app.post("/atleta/{strava_id}/sincronizar")
 def sincronizar_treinos(strava_id: int):
-    """
-    SINCRONIZAÇÃO INTELIGENTE (DELTA): Procura a data da última corrida e baixa apenas as novas.
-    """
+    """SINCRONIZAÇÃO INTELIGENTE (DELTA): Procura a data da última corrida e baixa apenas as novas."""
     res_db = supabase.table("usuarios_strava").select("refresh_token, historico_json").eq("id", strava_id).execute()
     if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
     atleta = res_db.data[0]
     historico_antigo = atleta.get('historico_json') or []
-    
     after_timestamp = None
+    
     if historico_antigo:
-        # Extrai o timestamp da atividade mais recente salva
         data_mais_nova_str = historico_antigo[0].get("start_date_local")
         if data_mais_nova_str:
             data_limpa = data_mais_nova_str.replace("Z", "+00:00")[:19]
@@ -241,7 +284,6 @@ def sincronizar_treinos(strava_id: int):
     treinos_novos = baixar_novos_treinos(access_token, after_timestamp)
     
     if treinos_novos:
-        # Adiciona os novos treinos ao topo do histórico antigo
         historico_atualizado = treinos_novos + historico_antigo
         supabase.table("usuarios_strava").update({"historico_json": historico_atualizado}).eq("id", strava_id).execute()
     else:
@@ -266,8 +308,11 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
     treinos_recentes = historico[:3]
     payload_para_ia = json.dumps(treinos_recentes, ensure_ascii=False)
     
+    altura_txt = f"{usuario.get('altura')}cm" if usuario.get('altura') else "Não informada"
+    
     prompt = f"""
-    Analise o atleta {usuario.get('nome')}. Use Jack Daniels e princípios biomecânicos para avaliar: {payload_para_ia}.
+    Analise o atleta {usuario.get('nome')}. Altura: {altura_txt}. 
+    Use Jack Daniels e princípios biomecânicos (relacione a altura com a cadência) para avaliar: {payload_para_ia}.
     Retorne ESTRITAMENTE um JSON: 'diagnostico_geral' (2 linhas), 'ponto_de_melhoria' (focado na biomecânica), 'nota_eficiencia' (0 a 10).
     """
     
@@ -279,7 +324,5 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
     )
     analise = json.loads(resposta_ia.text)
     
-    # Guarda o dossiê no banco para persistência no PWA
     supabase.table("usuarios_strava").update({"ia_report_json": analise}).eq("id", requisicao.strava_id).execute()
-    
     return analise
