@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import pandas as pd
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -11,14 +12,17 @@ from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (FastAPI)
+# Missão: Sincronização Inteligente & Fonte da Verdade
 # ==========================================
 
+# Carregamento das variáveis de ambiente (Configuradas no Render)
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
 STRAVA_CLIENT_SECRET = os.getenv("STRAVA_CLIENT_SECRET")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# Inicialização do Cliente Supabase
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 except Exception as e:
@@ -26,6 +30,7 @@ except Exception as e:
 
 app = FastAPI(title="API Analista de Bolso")
 
+# Configuração de CORS para permitir que a Vercel aceda ao motor
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,8 +45,12 @@ class StravaAuthRequest(BaseModel):
 class IAAnaliseRequest(BaseModel):
     strava_id: int
 
-# --- FUNÇÕES AUXILIARES ---
+# ==========================================
+# ⚙️ FUNÇÕES AUXILIARES & REGRAS DE NEGÓCIO
+# ==========================================
+
 def atualizar_token_strava(refresh_token: str) -> str:
+    """Renova o access_token expirado usando o refresh_token do utilizador."""
     url = 'https://www.strava.com/oauth/token'
     payload = {
         'client_id': STRAVA_CLIENT_ID,
@@ -54,20 +63,27 @@ def atualizar_token_strava(refresh_token: str) -> str:
         return res.json().get('access_token')
     raise HTTPException(status_code=401, detail="Falha ao renovar token do Strava")
 
-def baixar_e_tratar_treinos(access_token: str):
+def baixar_novos_treinos(access_token: str, after_timestamp: int = None):
+    """
+    Sincronização Delta: Procura no Strava APENAS atividades após o timestamp informado.
+    """
     url = 'https://www.strava.com/api/v3/athlete/activities'
     headers = {'Authorization': f'Bearer {access_token}'}
-    params = {'per_page': 30, 'page': 1}
+    params = {'per_page': 50, 'page': 1}
     
+    if after_timestamp:
+        params['after'] = after_timestamp
+
     res = requests.get(url, headers=headers, params=params)
     if res.status_code != 200: return []
         
-    dados_pagina = res.json()
-    if not dados_pagina: return []
+    dados = res.json()
+    if not dados: return []
         
-    df_bruto = pd.DataFrame(dados_pagina)
+    df_bruto = pd.DataFrame(dados)
     if 'type' not in df_bruto.columns: return []
         
+    # Filtra apenas corridas
     df_corridas = df_bruto[df_bruto['type'] == 'Run'].copy()
     if df_corridas.empty: return []
         
@@ -91,7 +107,56 @@ def baixar_e_tratar_treinos(access_token: str):
     json_string = df_corridas[colunas].to_json(orient='records', force_ascii=False, date_format='iso')
     return json.loads(json_string)
 
-# --- ENDPOINTS (TOMADAS) ---
+def calcular_estatisticas(historico: list) -> dict:
+    """
+    Calculadora Backend: Processa o histórico para extrair volumes de treino.
+    """
+    if not historico:
+        return {"totalDist": 0, "totalWorkouts": 0, "monthVolume": 0, "weekVolume": 0}
+
+    total_dist = 0
+    month_volume = 0
+    week_volume = 0
+    
+    hoje = datetime.now()
+    mes_atual = hoje.month
+    ano_atual = hoje.year
+    
+    # Define o início da semana (segunda-feira)
+    inicio_semana = hoje - timedelta(days=hoje.weekday())
+    inicio_semana = inicio_semana.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    for treino in historico:
+        dist = treino.get("distancia_km", 0)
+        total_dist += dist
+
+        data_str = treino.get("start_date_local")
+        if data_str:
+            try:
+                # Normalização da data para processamento
+                data_limpa = data_str.replace("Z", "+00:00")[:19]
+                data_treino = datetime.fromisoformat(data_limpa)
+
+                # Verifica se o treino pertence ao mês atual
+                if data_treino.month == mes_atual and data_treino.year == ano_atual:
+                    month_volume += dist
+
+                # Verifica se o treino pertence à semana atual
+                if data_treino >= inicio_semana:
+                    week_volume += dist
+            except Exception:
+                continue
+
+    return {
+        "totalDist": round(total_dist, 1),
+        "totalWorkouts": len(historico),
+        "monthVolume": round(month_volume, 1),
+        "weekVolume": round(week_volume, 1)
+    }
+
+# ==========================================
+# 🌐 ENDPOINTS (ROTAS DA API)
+# ==========================================
 
 @app.get("/")
 def health_check():
@@ -99,6 +164,7 @@ def health_check():
 
 @app.post("/auth/strava")
 def autenticar_strava(requisicao: StravaAuthRequest):
+    """Realiza a troca do code pelos tokens e guarda o utilizador no banco."""
     url = 'https://www.strava.com/oauth/token'
     payload = {
         'client_id': STRAVA_CLIENT_ID,
@@ -128,27 +194,69 @@ def autenticar_strava(requisicao: StravaAuthRequest):
 
 @app.get("/atleta/{strava_id}")
 def obter_dados_atleta(strava_id: int):
-    """Nova Rota: Entrega os dados do atleta para popular o Dashboard."""
+    """
+    FONTE DA VERDADE: Entrega Perfil, Estatísticas Calculadas e Histórico JSON.
+    """
     res_db = supabase.table("usuarios_strava").select("nome, foto_url, peso, idade, historico_json, ia_report_json").eq("id", strava_id).execute()
     if not res_db.data:
         raise HTTPException(status_code=404, detail="Atleta não encontrado.")
-    return res_db.data[0]
+    
+    dados = res_db.data[0]
+    historico = dados.get("historico_json") or []
+    estatisticas = calcular_estatisticas(historico)
+    
+    return {
+        "perfil": {
+            "nome": dados.get("nome"),
+            "foto_url": dados.get("foto_url"),
+            "peso": dados.get("peso"),
+            "idade": dados.get("idade")
+        },
+        "estatisticas": estatisticas,
+        "historico_json": historico,
+        "ia_report_json": dados.get("ia_report_json")
+    }
 
 @app.post("/atleta/{strava_id}/sincronizar")
 def sincronizar_treinos(strava_id: int):
-    """Nova Rota: Força o download dos treinos no Strava."""
-    res_db = supabase.table("usuarios_strava").select("refresh_token").eq("id", strava_id).execute()
+    """
+    SINCRONIZAÇÃO INTELIGENTE (DELTA): Procura a data da última corrida e baixa apenas as novas.
+    """
+    res_db = supabase.table("usuarios_strava").select("refresh_token, historico_json").eq("id", strava_id).execute()
     if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
-    refresh_token = res_db.data[0]['refresh_token']
-    access_token = atualizar_token_strava(refresh_token)
-    historico = baixar_e_tratar_treinos(access_token)
+    atleta = res_db.data[0]
+    historico_antigo = atleta.get('historico_json') or []
     
-    supabase.table("usuarios_strava").update({"historico_json": historico}).eq("id", strava_id).execute()
-    return {"status": "success", "historico": historico}
+    after_timestamp = None
+    if historico_antigo:
+        # Extrai o timestamp da atividade mais recente salva
+        data_mais_nova_str = historico_antigo[0].get("start_date_local")
+        if data_mais_nova_str:
+            data_limpa = data_mais_nova_str.replace("Z", "+00:00")[:19]
+            dt = datetime.fromisoformat(data_limpa)
+            after_timestamp = int(dt.timestamp())
+    
+    access_token = atualizar_token_strava(atleta['refresh_token'])
+    treinos_novos = baixar_novos_treinos(access_token, after_timestamp)
+    
+    if treinos_novos:
+        # Adiciona os novos treinos ao topo do histórico antigo
+        historico_atualizado = treinos_novos + historico_antigo
+        supabase.table("usuarios_strava").update({"historico_json": historico_atualizado}).eq("id", strava_id).execute()
+    else:
+        historico_atualizado = historico_antigo
+        
+    return {
+        "status": "success", 
+        "novos_treinos_baixados": len(treinos_novos),
+        "historico": historico_atualizado,
+        "estatisticas": calcular_estatisticas(historico_atualizado)
+    }
 
 @app.post("/ia/analise")
 def gerar_analise_ia(requisicao: IAAnaliseRequest):
+    """Aciona o Gemini para gerar o Dossiê biomecânico baseado nos últimos 3 treinos."""
     res_db = supabase.table("usuarios_strava").select("*").eq("id", requisicao.strava_id).execute()
     usuario = res_db.data[0]
     historico = usuario.get("historico_json")
@@ -171,7 +279,7 @@ def gerar_analise_ia(requisicao: IAAnaliseRequest):
     )
     analise = json.loads(resposta_ia.text)
     
-    # Salva a análise no banco para a próxima vez que o usuário entrar
+    # Guarda o dossiê no banco para persistência no PWA
     supabase.table("usuarios_strava").update({"ia_report_json": analise}).eq("id", requisicao.strava_id).execute()
     
     return analise
