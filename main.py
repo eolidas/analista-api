@@ -13,7 +13,7 @@ from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 2.1.1 - Restauração Completa de Perfil, Tênis e Clubes
+# Versão: 2.1.2 - Gênero e Estado Totalmente Sincronizados
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -115,7 +115,7 @@ def construir_perfil_seguro(dados_db: dict) -> dict:
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "2.1.1"}
+    return {"status": "Motor V8 Operante 🚀", "version": "2.1.2"}
 
 @app.post("/auth/strava")
 def autenticar_usuario(requisicao: StravaAuthRequest):
@@ -129,7 +129,6 @@ def autenticar_usuario(requisicao: StravaAuthRequest):
     atleta_resumo = token_data.get('athlete', {})
     atleta_id = atleta_resumo.get('id')
     
-    # RESTAURAÇÃO: Fazendo a busca detalhada do perfil no momento do login
     headers = {'Authorization': f'Bearer {access_token}'}
     res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
     atleta = res_perfil.json() if res_perfil.status_code == 200 else atleta_resumo
@@ -179,28 +178,32 @@ def sincronizar_e_atualizar(strava_id: int):
     headers = {'Authorization': f'Bearer {token_fresco}'}
     
     # ==========================================
-    # RESTAURAÇÃO: SINCRONIZAR PERFIL (Tênis, Clubes, Peso)
+    # RESTAURAÇÃO: SINCRONIZAR PERFIL COMPLETO
     # ==========================================
     res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
+    
+    perfil_atualizado_frontend = {} # Opcional para devolver ao frontend
     if res_perfil.status_code == 200:
         s = res_perfil.json()
         equipamentos = {"tenis": s.get('shoes') or [], "bicicletas": s.get('bikes') or []}
         clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in (s.get('clubs') or [])]
         
+        # Blindagem: Só sobreescrevemos se os dados não vierem nulos da API
         perfil_upd = {
-            "cidade": s.get('city'), 
-            "estado": s.get('state'),
             "equipamentos": equipamentos, 
             "clubes": clubes, 
-            "foto_url": s.get('profile')
         }
-        # Só sobrescreve o peso se o Strava tiver um peso registrado, evitando limpar dados manuais
+        if s.get('city'): perfil_upd["cidade"] = s.get('city')
+        if s.get('state'): perfil_upd["estado"] = s.get('state')
+        if s.get('sex'): perfil_upd["genero"] = s.get('sex')
+        if s.get('profile'): perfil_upd["foto_url"] = s.get('profile')
         if s.get('weight'): perfil_upd["peso"] = s.get('weight')
         
         supabase.table("usuarios_strava").update(perfil_upd).eq("id", strava_id).execute()
+        perfil_atualizado_frontend = perfil_upd
 
     # ==========================================
-    # VARREDURA ABSOLUTA DE TREINOS (Fantasmas e Mudanças de Tag)
+    # VARREDURA ABSOLUTA DE TREINOS
     # ==========================================
     url_activities = 'https://www.strava.com/api/v3/athlete/activities'
     treinos_brutos = []
@@ -211,7 +214,7 @@ def sincronizar_e_atualizar(strava_id: int):
         if res_strava.status_code != 200: raise HTTPException(status_code=500, detail="Falha na API Strava.")
         
         dados = res_strava.json()
-        if not dados: break # Se vier vazio, chegamos ao fim da vida do atleta
+        if not dados: break 
         
         treinos_brutos.extend(dados)
         if len(dados) < 200: break
@@ -220,7 +223,7 @@ def sincronizar_e_atualizar(strava_id: int):
     lista_final = formatar_atividades_para_banco(treinos_brutos)
     
     supabase.table("usuarios_strava").update({"historico_json": lista_final}).eq("id", strava_id).execute()
-    return {"status": "success", "historico_json": lista_final}
+    return {"status": "success", "historico_json": lista_final, "perfil_atualizado": perfil_atualizado_frontend}
 
 @app.post("/trofeus/garimpar/{strava_id}")
 def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
@@ -231,7 +234,6 @@ def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
     
     provas = [t for t in historico if t.get('workout_type') == 1]
     
-    # Se ele desmarcou todas as provas, apagamos os troféus no banco de dados para não ficar fantasma.
     if not provas:
         supabase.table("usuarios_strava").update({"trofeus_json": {}}).eq("id", strava_id).execute()
         return {"status": "success", "analisados": 0, "trofeus": {}, "msg": "Nenhuma prova oficial encontrada. A sua Sala de Troféus foi limpa."}
