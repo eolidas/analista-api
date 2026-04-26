@@ -13,7 +13,7 @@ from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 2.1.2 - Gênero e Estado Totalmente Sincronizados
+# Versão: 2.1.3 - Anti-Cold Start (Keep-Alive DB)
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -115,7 +115,21 @@ def construir_perfil_seguro(dados_db: dict) -> dict:
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "2.1.2"}
+    return {"status": "Motor V8 Operante 🚀", "version": "2.1.3"}
+
+@app.get("/keep-alive")
+def manter_acordado():
+    """
+    Rota tática para o UptimeRobot bater. 
+    Faz uma micro-consulta no banco para manter o pool de conexões do Supabase quente,
+    eliminando a lentidão do primeiro carregamento do app.
+    """
+    try:
+        # Traz apenas 1 ID do banco, o mínimo possível só para forçar atividade na rede
+        supabase.table("usuarios_strava").select("id").limit(1).execute()
+        return {"status": "Motor e Banco de Dados 100% Quentes! 🔥"}
+    except Exception as e:
+        return {"status": "Motor acordado, mas banco falhou.", "erro": str(e)}
 
 @app.post("/auth/strava")
 def autenticar_usuario(requisicao: StravaAuthRequest):
