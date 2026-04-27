@@ -13,7 +13,7 @@ from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 3.6.0 - Preparação para Módulo Climático (start_latlng)
+# Versão: 4.3.0 - Módulo de Zonas de Ritmo (Jack Daniels & Friel)
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -51,18 +51,24 @@ class BiometriaRequest(BaseModel):
 class TrofeusRequest(BaseModel):
     somente_provas: bool
 
-# --- Módulo Fisiológico ---
-class ConfigZonas(BaseModel):
+# --- Módulos Fisiológicos ---
+class ConfigZonasFC(BaseModel):
     metodo: str  # 'max', 'karvonen', 'limiar'
     fc_max: Optional[int] = None
     fc_repouso: Optional[int] = None
     fc_limiar: Optional[int] = None
 
+class ConfigZonasPace(BaseModel):
+    metodo: str  # 'daniels', 'friel'
+    distancia_km: Optional[float] = None
+    tempo_segundos: Optional[int] = None
+    pace_limiar: Optional[str] = None # Ex: "05:00"
+
 class ExtrairLimiarMultiRequest(BaseModel):
     activities: list[int]
 
 # ==========================================
-# ⚙️ FUNÇÕES DE ENGENHARIA DE DADOS
+# ⚙️ FUNÇÕES DE ENGENHARIA DE DADOS E CONVERSÃO
 # ==========================================
 
 def atualizar_token_strava(refresh_token: str) -> str:
@@ -127,21 +133,33 @@ def construir_perfil_seguro(dados_db: dict) -> dict:
         "fisiologia": dados_db.get("fisiologia_json") or {} 
     }
 
+def seg_to_pace_str(seg):
+    if seg <= 0: return "00:00"
+    m = int(seg // 60)
+    s = int(round(seg % 60))
+    if s == 60:
+        m += 1
+        s = 0
+    return f"{m:02d}:{s:02d}"
+
+def pace_str_to_seg(pace_str):
+    if not pace_str or ':' not in pace_str: return 0
+    partes = pace_str.split(':')
+    if len(partes) == 2:
+        m, s = map(int, partes)
+        return m * 60 + s
+    elif len(partes) == 3:
+        h, m, s = map(int, partes)
+        return h * 3600 + m * 60 + s
+    return 0
+
 # ==========================================
 # 🌐 ROTAS DA API - OAUTH & SINCRONIZAÇÃO
 # ==========================================
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "3.6.0"}
-
-@app.get("/keep-alive")
-def manter_acordado():
-    try:
-        supabase.table("usuarios_strava").select("id").limit(1).execute()
-        return {"status": "Motor e Banco de Dados 100% Quentes! 🔥"}
-    except Exception as e:
-        return {"status": "Motor acordado, mas banco falhou.", "erro": str(e)}
+    return {"status": "Motor V8 Operante 🚀", "version": "4.3.0"}
 
 @app.post("/auth/strava")
 def autenticar_usuario(requisicao: StravaAuthRequest):
@@ -201,21 +219,17 @@ def sincronizar_e_atualizar(strava_id: int):
     headers = {'Authorization': f'Bearer {token_fresco}'}
     
     res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
-    perfil_atualizado_frontend = {}
     if res_perfil.status_code == 200:
         s = res_perfil.json()
         equipamentos = {"tenis": s.get('shoes') or [], "bicicletas": s.get('bikes') or []}
         clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in (s.get('clubs') or [])]
-        
         perfil_upd = {"equipamentos": equipamentos, "clubes": clubes}
         if s.get('city'): perfil_upd["cidade"] = s.get('city')
         if s.get('state'): perfil_upd["estado"] = s.get('state')
         if s.get('sex'): perfil_upd["genero"] = s.get('sex')
         if s.get('profile'): perfil_upd["foto_url"] = s.get('profile')
         if s.get('weight'): perfil_upd["peso"] = s.get('weight')
-        
         supabase.table("usuarios_strava").update(perfil_upd).eq("id", strava_id).execute()
-        perfil_atualizado_frontend = perfil_upd
 
     url_activities = 'https://www.strava.com/api/v3/athlete/activities'
     treinos_brutos = []
@@ -232,7 +246,7 @@ def sincronizar_e_atualizar(strava_id: int):
         
     lista_final = formatar_atividades_para_banco(treinos_brutos)
     supabase.table("usuarios_strava").update({"historico_json": lista_final}).eq("id", strava_id).execute()
-    return {"status": "success", "historico_json": lista_final, "perfil_atualizado": perfil_atualizado_frontend}
+    return {"status": "success", "historico_json": lista_final}
 
 # ==========================================
 # 🌐 ROTAS DA API - IA & TROFÉUS
@@ -246,10 +260,9 @@ def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
     historico = usuario.get("historico_json") or []
     
     provas = [t for t in historico if t.get('workout_type') == 1]
-    
     if not provas:
         supabase.table("usuarios_strava").update({"trofeus_json": {}}).eq("id", strava_id).execute()
-        return {"status": "success", "analisados": 0, "trofeus": {}, "msg": "Nenhuma prova oficial encontrada. A sua Sala de Troféus foi limpa."}
+        return {"status": "success", "analisados": 0, "trofeus": {}, "msg": "Nenhuma prova oficial encontrada."}
 
     headers = {'Authorization': f'Bearer {token}'}
     distancias_mapa = {"1k": "1k", "5k": "5k", "10k": "10k", "half marathon": "Half Marathon", "marathon": "Marathon"}
@@ -309,13 +322,12 @@ def atualizar_biometria(strava_id: int, req: BiometriaRequest):
     return {"status": "success"}
 
 # ==========================================
-# 🌐 ROTAS DA API - FISIOLOGIA E MATRIZ AVANÇADA
+# 🌐 ROTAS DA API - ZONAS CARDÍACAS E DE RITMO
 # ==========================================
 
 @app.post("/fisiologia/calcular-zonas/{strava_id}")
-def calcular_zonas_cardiacas(strava_id: int, req: ConfigZonas):
-    """Motor de cálculo fisiológico com rigor científico (Friel, ACSM, Karvonen)."""
-    zonas = []
+def calcular_zonas_cardiacas(strava_id: int, req: ConfigZonasFC):
+    """Calcula Zonas de FC (Batimentos) e mescla com os dados de Ritmo já existentes no Banco."""
     try:
         if req.metodo == 'max':
             if not req.fc_max: raise ValueError("FC Máxima não informada.")
@@ -344,25 +356,91 @@ def calcular_zonas_cardiacas(strava_id: int, req: ConfigZonas):
                 {"id": 1, "nome": "Z1 - Recuperação", "min": int(lt * 0.65), "max": int(lt * 0.84), "tema": "cinza", "desc": "Regenerativo (<85% LTHR)"},
                 {"id": 2, "nome": "Z2 - Base Aeróbica", "min": int(lt * 0.85), "max": int(lt * 0.89), "tema": "azul", "desc": "Resistência (85-89% LTHR)"},
                 {"id": 3, "nome": "Z3 - Tempo", "min": int(lt * 0.90), "max": int(lt * 0.94), "tema": "verde", "desc": "Ritmo Constante (90-94% LTHR)"},
-                {"id": 4, "nome": "Z4 - Limiar de Lactato", "min": int(lt * 0.95), "max": int(lt * 0.99), "tema": "laranja", "desc": "No Limite do Ácido (95-99% LTHR)"},
+                {"id": 4, "nome": "Z4 - Limiar", "min": int(lt * 0.95), "max": int(lt * 0.99), "tema": "laranja", "desc": "No Limite do Ácido (95-99% LTHR)"},
                 {"id": 5, "nome": "Z5 - Anaeróbico", "min": lt, "max": int(lt * 1.05), "tema": "vermelho", "desc": "Explosão / VO2 (>100% LTHR)"},
             ]
         else:
-            raise ValueError("Metodologia inválida.")
+            raise ValueError("Metodologia de FC inválida.")
         
-        fisiologia_data = {"metodo": req.metodo, "fc_max": req.fc_max, "fc_repouso": req.fc_repouso, "fc_limiar": req.fc_limiar, "zonas": zonas}
-        supabase.table("usuarios_strava").update({"fisiologia_json": fisiologia_data}).eq("id", strava_id).execute()
-        return {"status": "success", "zonas": zonas, "fisiologia_salva": fisiologia_data}
+        # Merge Seguro: Preserva as configurações de Pace se existirem
+        res_db = supabase.table("usuarios_strava").select("fisiologia_json").eq("id", strava_id).execute()
+        fisiologia_atual = res_db.data[0].get("fisiologia_json") or {} if res_db.data else {}
+        
+        fisiologia_atual.update({
+            "metodo": req.metodo, 
+            "fc_max": req.fc_max, 
+            "fc_repouso": req.fc_repouso, 
+            "fc_limiar": req.fc_limiar, 
+            "zonas": zonas
+        })
+        
+        supabase.table("usuarios_strava").update({"fisiologia_json": fisiologia_atual}).eq("id", strava_id).execute()
+        return {"status": "success", "zonas": zonas, "fisiologia_salva": fisiologia_atual}
+        
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.post("/fisiologia/calcular-zonas-pace/{strava_id}")
+def calcular_zonas_ritmo(strava_id: int, req: ConfigZonasPace):
+    """Novo Motor de Zonas de Ritmo (Pace) via Jack Daniels (VDOT) ou Joe Friel."""
+    try:
+        pace_limiar_seg = 0
+        
+        # 1. Determinação do Limiar de Pace Base (em segundos)
+        if req.metodo in ['daniels', 'friel']:
+            if req.distancia_km and req.tempo_segundos:
+                # Usa Riegel para converter qualquer prova para o equivalente em 10k (Limiar)
+                t_10k_sec = req.tempo_segundos * ((10.0 / req.distancia_km) ** 1.06)
+                pace_limiar_seg = t_10k_sec / 10.0
+            elif req.pace_limiar:
+                pace_limiar_seg = pace_str_to_seg(req.pace_limiar)
+            else:
+                raise ValueError("Para gerar o Ritmo, informe a Distância/Tempo ou o Pace Manual.")
+        else:
+            raise ValueError("Metodologia de Pace inválida.")
+
+        zonas = []
+        
+        # 2. Metodologia Jack Daniels (Aproximação Cinética)
+        if req.metodo == 'daniels':
+            zonas = [
+                {"id": 1, "nome": "Pace E (Fácil/Easy)", "min": seg_to_pace_str(pace_limiar_seg * 1.30), "max": seg_to_pace_str(pace_limiar_seg * 1.20), "tema": "cinza", "desc": "Aquecimento e Resistência Longa"},
+                {"id": 2, "nome": "Pace M (Maratona)", "min": seg_to_pace_str(pace_limiar_seg * 1.15), "max": seg_to_pace_str(pace_limiar_seg * 1.08), "tema": "azul", "desc": "Ritmo Específico de Prova (42k)"},
+                {"id": 3, "nome": "Pace T (Limiar)", "min": seg_to_pace_str(pace_limiar_seg * 1.03), "max": seg_to_pace_str(pace_limiar_seg * 0.98), "tema": "verde", "desc": "Desconfortável Constante (Tempo Run)"},
+                {"id": 4, "nome": "Pace I (Intervalado)", "min": seg_to_pace_str(pace_limiar_seg * 0.95), "max": seg_to_pace_str(pace_limiar_seg * 0.90), "tema": "laranja", "desc": "Estímulos VO2 Max (3 a 5 min)"},
+                {"id": 5, "nome": "Pace R (Repetição)", "min": seg_to_pace_str(pace_limiar_seg * 0.88), "max": seg_to_pace_str(pace_limiar_seg * 0.80), "tema": "vermelho", "desc": "Tiros de Velocidade Pura (Pista)"},
+            ]
+        
+        # 3. Metodologia Joe Friel (Pace Baseado no LT)
+        elif req.metodo == 'friel':
+            zonas = [
+                {"id": 1, "nome": "Z1 - Recuperação", "min": seg_to_pace_str(pace_limiar_seg * 1.40), "max": seg_to_pace_str(pace_limiar_seg * 1.29), "tema": "cinza", "desc": "Pace Regenerativo (Trote)"},
+                {"id": 2, "nome": "Z2 - Aeróbico", "min": seg_to_pace_str(pace_limiar_seg * 1.28), "max": seg_to_pace_str(pace_limiar_seg * 1.14), "tema": "azul", "desc": "Endurance e Construção Base"},
+                {"id": 3, "nome": "Z3 - Tempo", "min": seg_to_pace_str(pace_limiar_seg * 1.13), "max": seg_to_pace_str(pace_limiar_seg * 1.06), "tema": "verde", "desc": "Ritmo Forte de Meia Maratona"},
+                {"id": 4, "nome": "Z4 - Limiar", "min": seg_to_pace_str(pace_limiar_seg * 1.05), "max": seg_to_pace_str(pace_limiar_seg * 0.99), "tema": "laranja", "desc": "No limiar do Lactato (Pace 10k)"},
+                {"id": 5, "nome": "Z5 - Anaeróbico", "min": seg_to_pace_str(pace_limiar_seg * 0.98), "max": seg_to_pace_str(pace_limiar_seg * 0.85), "tema": "vermelho", "desc": "Sprint / Capacidade Anaeróbica"},
+            ]
+
+        # Merge Seguro: Preserva as configurações de FC
+        res_db = supabase.table("usuarios_strava").select("fisiologia_json").eq("id", strava_id).execute()
+        fisiologia_atual = res_db.data[0].get("fisiologia_json") or {} if res_db.data else {}
+        
+        fisiologia_atual.update({
+            "metodo_pace": req.metodo,
+            "pace_limiar": seg_to_pace_str(pace_limiar_seg),
+            "zonas_pace": zonas,
+            "dist_ref_pace": req.distancia_km,
+            "tempo_ref_pace": req.tempo_segundos
+        })
+        
+        supabase.table("usuarios_strava").update({"fisiologia_json": fisiologia_atual}).eq("id", strava_id).execute()
+        return {"status": "success", "zonas_pace": zonas, "fisiologia_salva": fisiologia_atual}
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/fisiologia/extrair-limiar/{strava_id}")
 def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
-    """
-    Matriz Fisiológica: Analisa até 3 corridas de uma vez, processa os Streams (33%), 
-    Elevação, Temperatura e Altitude para achar a média perfeita de Limiar de Lactato.
-    """
     if not req.activities:
         raise HTTPException(status_code=400, detail="Nenhuma corrida selecionada.")
         
@@ -376,7 +454,6 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
     resultados_lthr = []
     log_relatorio = ""
     
-    # Processa até 3 provas (Matriz Média)
     for act_id in req.activities[:3]:
         res_atividade = requests.get(f"https://www.strava.com/api/v3/activities/{act_id}", headers=headers)
         if res_atividade.status_code != 200: continue
@@ -392,9 +469,6 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
             log_relatorio += f"⚠️ {nome_prova}: Ignorada (Sem BPM registrado).\n\n"
             continue
             
-        # ==========================================
-        # 1. ANÁLISE DE STREAMS (SEGUNDO A SEGUNDO)
-        # ==========================================
         url_streams = f"https://www.strava.com/api/v3/activities/{act_id}/streams?keys=heartrate&key_by_type=true"
         res_streams = requests.get(url_streams, headers=headers)
         
@@ -405,20 +479,15 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
             streams = res_streams.json()
             if 'heartrate' in streams:
                 hr_data = streams['heartrate']['data']
-                # Descarta 33% iniciais (Aquecimento Total) e foca na estabilização
                 start_idx = int(len(hr_data) * 0.33)
                 hr_isolado = hr_data[start_idx:]
                 if hr_isolado:
                     bpm_base = sum(hr_isolado) / len(hr_isolado)
                     usou_streams = True
 
-        # ==========================================
-        # 2. MATRIZ DE COMPENSAÇÃO FISIOLÓGICA
-        # ==========================================
         fator_correcao = 1.0
         logs = []
         
-        # A) Compensação de Distância (Esforço)
         if 4.5 <= distancia_km <= 5.5:
             fator_correcao -= 0.01
             logs.append("Distância (5k): -1% Fator (Supra-limiar)")
@@ -428,7 +497,6 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
             fator_correcao += 0.05
             logs.append("Distância (Meia): +5% Fator (Sub-limiar)")
             
-        # B) Compensação de Altimetria
         elev_por_km = total_elevacao / distancia_km if distancia_km > 0 else 0
         if elev_por_km > 20:
             fator_correcao -= 0.02
@@ -437,7 +505,6 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
             fator_correcao -= 0.01
             logs.append("Elevação Média (>10m/km): -1% Fator")
             
-        # C) Compensação de Temperatura (se disponível)
         avg_temp = dados.get('average_temp')
         if avg_temp is not None:
             if avg_temp >= 28:
@@ -447,15 +514,12 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
                 fator_correcao -= 0.02
                 logs.append(f"Calor Alto ({avg_temp}°C): -2% Fator")
                 
-        # D) Compensação de Altitude (Falta de Oxigênio)
         elev_high = dados.get('elev_high')
         if elev_high is not None and elev_high > 1500:
             fator_correcao -= 0.03
             logs.append(f"Altitude Extrema (>1500m): -3% Fator")
             
-        # CÁLCULO FINAL DESTA PROVA
         if not usou_streams and (4.5 <= distancia_km <= 5.5) and bpm_maximo > 140:
-            # Se falhou streams no 5k, a média é muito suja. Puxamos do Max.
             lthr_prova = int(bpm_maximo * (0.92 - (1.0 - fator_correcao)))
             logs.append(f"Sem Streams. Limiar deduzido da FC Máx ({bpm_maximo} bpm).")
         else:
@@ -466,15 +530,10 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
                 logs.append(f"Sem Streams: Média bruta ({int(bpm_base)} bpm) com forte ruído de aquecimento.")
 
         resultados_lthr.append(lthr_prova)
-        
-        # Constrói o texto do relatório
         log_relatorio += f"🏃‍♂️ {nome_prova}\n"
         for l in logs: log_relatorio += f"  {l}\n"
         log_relatorio += f"  ↳ Limiar Resultante: {lthr_prova} bpm\n\n"
 
-    # ==========================================
-    # 3. CONSOLIDAÇÃO DA MÉDIA
-    # ==========================================
     if not resultados_lthr:
         raise HTTPException(status_code=400, detail="Não foi possível extrair dados de nenhuma corrida selecionada.")
         
