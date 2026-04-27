@@ -13,7 +13,7 @@ from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 3.2.0 - Extração de Limiar via STREAMS (Padrão Ouro Friel)
+# Versão: 3.3.0 - Extração de Limiar via STREAMS Dinâmico (Friel 33%)
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -127,7 +127,7 @@ def construir_perfil_seguro(dados_db: dict) -> dict:
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "3.2.0"}
+    return {"status": "Motor V8 Operante 🚀", "version": "3.3.0"}
 
 @app.get("/keep-alive")
 def manter_acordado():
@@ -353,8 +353,8 @@ def calcular_zonas_cardiacas(strava_id: int, req: ConfigZonas):
 @app.get("/fisiologia/extrair-limiar/{strava_id}/{activity_id}")
 def extrair_limiar_de_prova(strava_id: int, activity_id: int):
     """
-    Motor Científico: Puxa Streams do Strava, descarta a rampa de aquecimento (1.5km) 
-    e extrai o verdadeiro Limiar estabilizado usando a matemática de Joe Friel.
+    Motor Científico: Puxa Streams do Strava e aplica a Análise Dinâmica de Terços
+    para expurgar tempos de aquecimento ou rampas cardíacas.
     """
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     usuario = res_db.data[0]
@@ -369,15 +369,16 @@ def extrair_limiar_de_prova(strava_id: int, activity_id: int):
     dados = res_atividade.json()
     distancia_km = dados.get('distance', 0) / 1000.0
     bpm_medio_geral = dados.get('average_heartrate', 0)
+    bpm_maximo = dados.get('max_heartrate', 0)
     nome_prova = dados.get('name', 'Prova Oficial')
     
-    if bpm_medio_geral == 0:
+    if bpm_medio_geral == 0 or bpm_maximo == 0:
         raise HTTPException(status_code=400, detail="Esta atividade não possui registros cardíacos (cinta/relógio).")
 
     # ==========================================
     # ANÁLISE DE STREAMS (SEGUNDO A SEGUNDO)
     # ==========================================
-    url_streams = f"https://www.strava.com/api/v3/activities/{activity_id}/streams?keys=heartrate,distance&key_by_type=true"
+    url_streams = f"https://www.strava.com/api/v3/activities/{activity_id}/streams?keys=heartrate&key_by_type=true"
     res_streams = requests.get(url_streams, headers=headers)
     
     bpm_base_calculo = bpm_medio_geral
@@ -385,47 +386,57 @@ def extrair_limiar_de_prova(strava_id: int, activity_id: int):
     
     if res_streams.status_code == 200:
         streams = res_streams.json()
-        if 'heartrate' in streams and 'distance' in streams:
+        if 'heartrate' in streams:
             hr_data = streams['heartrate']['data']
-            dist_data = streams['distance']['data']
             
-            # Protocolo Ouro: Descartar os primeiros 1.500m (fase de rampa de aquecimento cardíaca)
-            hr_isolado = [hr for hr, d in zip(hr_data, dist_data) if d > 1500]
+            # PROTOCOLO PADRÃO OURO DE FRIEL (Análise de Rampa):
+            # Descartes dos primeiros 33% da prova inteira para focar na estabilização
+            start_idx = int(len(hr_data) * 0.33)
+            hr_isolado = hr_data[start_idx:]
             
             if hr_isolado:
                 bpm_base_calculo = sum(hr_isolado) / len(hr_isolado)
                 usou_streams = True
 
     # ==========================================
-    # MATEMÁTICA DE COMPENSAÇÃO (JOE FRIEL)
+    # MATEMÁTICA DE COMPENSAÇÃO INTELIGENTE
     # ==========================================
     if 4.5 <= distancia_km <= 5.5:
-        fator = 1.05
-        limiar_estimado = int(bpm_base_calculo / fator)
         if usou_streams:
-            detalhe_metodo = f"• Análise de Streams (Segundo a Segundo)\n• Primeiros 1.5km (Rampa/Aquecimento) foram descartados.\n• FC Média do Trecho Estabilizado: {int(bpm_base_calculo)} bpm\n• Esforço de 5k é supra-limiar, portanto dividimos a média por {fator}."
+            # O trecho final estabilizado do 5k é a mais pura expressão do limiar de lactato 
+            # de um atleta rápido. Usamos fator 0.99 apenas como safety net.
+            limiar_estimado = int(bpm_base_calculo * 0.99)
+            detalhe_metodo = f"• Análise de Streams (Segundo a Segundo).\n• Primeiro terço (rampa cardíaca) expurgado.\n• Média Estabilizada: {int(bpm_base_calculo)} bpm.\n• Fator 0.99x (Ajuste fino de 5k)."
         else:
-            detalhe_metodo = f"• Análise de Resumo (Sem Streams)\n• FC Média Geral: {int(bpm_base_calculo)} bpm\n• Esforço de 5k dividido por {fator}."
-            
+            # Sem os streams, a média sofre drásticamente por causa do aquecimento.
+            # O mais seguro é extrair 92% do Pico Máximo para evitar "falsos baixos".
+            if bpm_maximo > 140:
+                limiar_estimado = int(bpm_maximo * 0.92)
+                detalhe_metodo = f"• API de Streams indisponível (Resumo).\n• Média suja ignorada.\n• Estimado a 92% da FC Máxima atingida na prova ({bpm_maximo} bpm)."
+            else:
+                limiar_estimado = int(bpm_medio_geral * 1.03)
+                detalhe_metodo = f"• API de Streams indisponível.\n• Limiar estimado com acréscimo de 3% sobre a média bruta."
+                
     elif 9.5 <= distancia_km <= 10.5:
-        fator = 1.00
-        limiar_estimado = int(bpm_base_calculo / fator)
         if usou_streams:
-            detalhe_metodo = f"• Análise de Streams (Segundo a Segundo)\n• Primeiros 1.5km descartados.\n• FC Média do Trecho = Seu Limiar Direto: {int(bpm_base_calculo)} bpm."
+            limiar_estimado = int(bpm_base_calculo * 1.00)
+            detalhe_metodo = f"• Análise de Streams ativa.\n• Primeiro terço expurgado.\n• Média Estabilizada (10k) = Limiar Direto ({int(bpm_base_calculo)} bpm)."
         else:
-            detalhe_metodo = f"• FC Média Geral: {int(bpm_base_calculo)} bpm\n• O esforço médio de um 10k reflete o Limiar Direto."
+            limiar_estimado = int(bpm_medio_geral * 1.00)
+            detalhe_metodo = f"• Análise de Resumo.\n• Média Geral do 10k = Limiar Direto ({int(bpm_medio_geral)} bpm)."
             
     elif 20.0 <= distancia_km <= 22.0:
-        fator = 1.05
-        limiar_estimado = int(bpm_base_calculo * fator)
-        detalhe_metodo = f"• FC Média do Trecho: {int(bpm_base_calculo)} bpm\n• A Meia Maratona é corrida abaixo do limiar (Fator Multiplicador aplicado)."
+        limiar_estimado = int(bpm_base_calculo * 1.05)
+        detalhe_metodo = f"• Análise de Meia Maratona.\n• Multiplicador de 1.05x (Esforço sub-limiar) sobre a média de {int(bpm_base_calculo)} bpm."
+        
     else:
         limiar_estimado = int(bpm_base_calculo)
-        detalhe_metodo = f"• Distância atípica para teste. Usada FC Média Bruta do trecho ({int(bpm_base_calculo)} bpm)."
+        detalhe_metodo = f"• Distância atípica de teste.\n• FC Média utilizada diretamente: {int(bpm_base_calculo)} bpm."
     
     return {
         "status": "success", 
         "limiar_estimado": limiar_estimado, 
+        "bpm_medio_real": bpm_medio_geral,
         "metodo_usado": detalhe_metodo,
         "nome_prova": nome_prova
     }
