@@ -13,7 +13,7 @@ from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 3.5.0 - Motor de Limiar Multi-Provas e Matriz Fisiológica
+# Versão: 3.6.0 - Preparação para Módulo Climático (start_latlng)
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -95,10 +95,13 @@ def formatar_atividades_para_banco(lista_bruta):
     df['Cadence_SPM'] = df['average_cadence'] * 2 if 'average_cadence' in df.columns else 0
     df['total_elevation_gain'] = df['total_elevation_gain'].fillna(0) if 'total_elevation_gain' in df.columns else 0
     
-    colunas_finais = ['id', 'type', 'workout_type', 'name', 'distancia_km', 'Pace_Medio', 'average_heartrate', 'max_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local', 'elapsed_time']
-    
     if 'elapsed_time' not in df.columns:
         df['elapsed_time'] = df['moving_time']
+        
+    if 'start_latlng' not in df.columns:
+        df['start_latlng'] = None
+        
+    colunas_finais = ['id', 'type', 'workout_type', 'name', 'distancia_km', 'Pace_Medio', 'average_heartrate', 'max_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local', 'elapsed_time', 'start_latlng']
         
     res_json = df[colunas_finais].to_json(orient='records', force_ascii=False, date_format='iso')
     return json.loads(res_json)
@@ -130,7 +133,7 @@ def construir_perfil_seguro(dados_db: dict) -> dict:
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "3.5.0"}
+    return {"status": "Motor V8 Operante 🚀", "version": "3.6.0"}
 
 @app.get("/keep-alive")
 def manter_acordado():
@@ -230,6 +233,10 @@ def sincronizar_e_atualizar(strava_id: int):
     lista_final = formatar_atividades_para_banco(treinos_brutos)
     supabase.table("usuarios_strava").update({"historico_json": lista_final}).eq("id", strava_id).execute()
     return {"status": "success", "historico_json": lista_final, "perfil_atualizado": perfil_atualizado_frontend}
+
+# ==========================================
+# 🌐 ROTAS DA API - IA & TROFÉUS
+# ==========================================
 
 @app.post("/trofeus/garimpar/{strava_id}")
 def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
