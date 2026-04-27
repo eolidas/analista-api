@@ -13,7 +13,7 @@ from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 3.0.0 - Motor de Zonas Fisiológicas & Limiar
+# Versão: 3.1.0 - Motor Fisiológico Avançado (Joe Friel & Tanaka)
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -51,7 +51,7 @@ class BiometriaRequest(BaseModel):
 class TrofeusRequest(BaseModel):
     somente_provas: bool
 
-# --- NOVO: Módulo Fisiológico ---
+# --- Módulo Fisiológico ---
 class ConfigZonas(BaseModel):
     metodo: str  # 'max', 'karvonen', 'limiar'
     fc_max: Optional[int] = None
@@ -92,7 +92,12 @@ def formatar_atividades_para_banco(lista_bruta):
     df['Cadence_SPM'] = df['average_cadence'] * 2 if 'average_cadence' in df.columns else 0
     df['total_elevation_gain'] = df['total_elevation_gain'].fillna(0) if 'total_elevation_gain' in df.columns else 0
     
-    colunas_finais = ['id', 'type', 'workout_type', 'name', 'distancia_km', 'Pace_Medio', 'average_heartrate', 'max_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local']
+    colunas_finais = ['id', 'type', 'workout_type', 'name', 'distancia_km', 'Pace_Medio', 'average_heartrate', 'max_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local', 'elapsed_time']
+    
+    # Tratamento caso elapsed_time não exista em alguma atividade antiga
+    if 'elapsed_time' not in df.columns:
+        df['elapsed_time'] = df['moving_time']
+        
     res_json = df[colunas_finais].to_json(orient='records', force_ascii=False, date_format='iso')
     return json.loads(res_json)
 
@@ -113,7 +118,8 @@ def construir_perfil_seguro(dados_db: dict) -> dict:
         "genero": dados_db.get("genero") or "",
         "data_criacao": dados_db.get("data_criacao") or "",
         "clubes": dados_db.get("clubes") or [],
-        "equipamentos": equip
+        "equipamentos": equip,
+        "fisiologia": dados_db.get("fisiologia_json") or {}
     }
 
 # ==========================================
@@ -122,7 +128,15 @@ def construir_perfil_seguro(dados_db: dict) -> dict:
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "3.0.0"}
+    return {"status": "Motor V8 Operante 🚀", "version": "3.1.0"}
+
+@app.get("/keep-alive")
+def manter_acordado():
+    try:
+        supabase.table("usuarios_strava").select("id").limit(1).execute()
+        return {"status": "Motor e Banco de Dados 100% Quentes! 🔥"}
+    except Exception as e:
+        return {"status": "Motor acordado, mas banco falhou.", "erro": str(e)}
 
 @app.post("/auth/strava")
 def autenticar_usuario(requisicao: StravaAuthRequest):
@@ -290,60 +304,69 @@ def atualizar_biometria(strava_id: int, req: BiometriaRequest):
     return {"status": "success"}
 
 # ==========================================
-# 🌐 ROTAS DA API - FISIOLOGIA (NOVO)
+# 🌐 ROTAS DA API - FISIOLOGIA (ZONAS E LIMIAR)
 # ==========================================
 
-@app.post("/fisiologia/calcular-zonas")
-def calcular_zonas_cardiacas(req: ConfigZonas):
-    """Motor de cálculo fisiológico. Suporta 3 metodologias oficiais."""
+@app.post("/fisiologia/calcular-zonas/{strava_id}")
+def calcular_zonas_cardiacas(strava_id: int, req: ConfigZonas):
+    """Motor de cálculo fisiológico com rigor científico (Friel, ACSM, Karvonen)."""
     zonas = []
     
     try:
         if req.metodo == 'max':
-            if not req.fc_max: raise ValueError("Falta FC Máxima")
-            # Metodologia Base: Porcentagem simples da Máxima
+            if not req.fc_max: raise ValueError("FC Máxima não informada.")
+            # Zonas clássicas (ACSM - American College of Sports Medicine)
             zonas = [
-                {"id": 1, "nome": "Z1 - Recuperação", "min": int(req.fc_max * 0.50), "max": int(req.fc_max * 0.59), "cor": "bg-gray-500", "desc": "Trote Leve / Regenerativo"},
-                {"id": 2, "nome": "Z2 - Aeróbico Base", "min": int(req.fc_max * 0.60), "max": int(req.fc_max * 0.69), "cor": "bg-blue-500", "desc": "Resistência / Longão"},
-                {"id": 3, "nome": "Z3 - Tempo Run", "min": int(req.fc_max * 0.70), "max": int(req.fc_max * 0.79), "cor": "bg-emerald-500", "desc": "Ritmo de Maratona"},
-                {"id": 4, "nome": "Z4 - Limiar", "min": int(req.fc_max * 0.80), "max": int(req.fc_max * 0.89), "cor": "bg-orange-500", "desc": "Pace de 10k / Desconfortável"},
-                {"id": 5, "nome": "Z5 - Anaeróbico", "min": int(req.fc_max * 0.90), "max": req.fc_max, "cor": "bg-red-500", "desc": "Tiros / Esforço Máximo"},
+                {"id": 1, "nome": "Z1 - Recuperação", "min": int(req.fc_max * 0.50), "max": int(req.fc_max * 0.59), "tema": "cinza", "desc": "Aquecimento / Regenerativo"},
+                {"id": 2, "nome": "Z2 - Aeróbico", "min": int(req.fc_max * 0.60), "max": int(req.fc_max * 0.69), "tema": "azul", "desc": "Resistência Base / Longão"},
+                {"id": 3, "nome": "Z3 - Tempo Run", "min": int(req.fc_max * 0.70), "max": int(req.fc_max * 0.79), "tema": "verde", "desc": "Ritmo de Maratona"},
+                {"id": 4, "nome": "Z4 - Limiar", "min": int(req.fc_max * 0.80), "max": int(req.fc_max * 0.89), "tema": "laranja", "desc": "Pace de 10k / Desconfortável"},
+                {"id": 5, "nome": "Z5 - Anaeróbico", "min": int(req.fc_max * 0.90), "max": req.fc_max, "tema": "vermelho", "desc": "Tiros / Esforço Máximo"},
             ]
             
         elif req.metodo == 'karvonen':
-            if not req.fc_max or not req.fc_repouso: raise ValueError("Falta FC Máxima ou de Repouso")
-            # Metodologia Karvonen: Frequência Cardíaca de Reserva (FCR)
+            if not req.fc_max or not req.fc_repouso: raise ValueError("Falta FC Máxima ou de Repouso.")
             fcr = req.fc_max - req.fc_repouso
             def calc_karvonen(perc): return int((fcr * perc) + req.fc_repouso)
             zonas = [
-                {"id": 1, "nome": "Z1 - Recuperação", "min": calc_karvonen(0.50), "max": calc_karvonen(0.59), "cor": "bg-gray-500", "desc": "Trote Leve / Regenerativo"},
-                {"id": 2, "nome": "Z2 - Aeróbico Base", "min": calc_karvonen(0.60), "max": calc_karvonen(0.69), "cor": "bg-blue-500", "desc": "Resistência / Longão"},
-                {"id": 3, "nome": "Z3 - Tempo Run", "min": calc_karvonen(0.70), "max": calc_karvonen(0.79), "cor": "bg-emerald-500", "desc": "Ritmo de Maratona"},
-                {"id": 4, "nome": "Z4 - Limiar", "min": calc_karvonen(0.80), "max": calc_karvonen(0.89), "cor": "bg-orange-500", "desc": "Pace de 10k / Desconfortável"},
-                {"id": 5, "nome": "Z5 - Anaeróbico", "min": calc_karvonen(0.90), "max": req.fc_max, "cor": "bg-red-500", "desc": "Tiros / Esforço Máximo"},
+                {"id": 1, "nome": "Z1 - Recuperação", "min": calc_karvonen(0.50), "max": calc_karvonen(0.59), "tema": "cinza", "desc": "Aquecimento / Regenerativo"},
+                {"id": 2, "nome": "Z2 - Aeróbico", "min": calc_karvonen(0.60), "max": calc_karvonen(0.69), "tema": "azul", "desc": "Resistência Base / Longão"},
+                {"id": 3, "nome": "Z3 - Tempo Run", "min": calc_karvonen(0.70), "max": calc_karvonen(0.79), "tema": "verde", "desc": "Ritmo de Maratona"},
+                {"id": 4, "nome": "Z4 - Limiar", "min": calc_karvonen(0.80), "max": calc_karvonen(0.89), "tema": "laranja", "desc": "Pace de 10k / Desconfortável"},
+                {"id": 5, "nome": "Z5 - Anaeróbico", "min": calc_karvonen(0.90), "max": req.fc_max, "tema": "vermelho", "desc": "Tiros / Esforço Máximo"},
             ]
             
         elif req.metodo == 'limiar':
-            if not req.fc_limiar: raise ValueError("Falta FC de Limiar (LTHR)")
-            # Metodologia Joe Friel: Baseada no Ponto de Limiar de Lactato
+            if not req.fc_limiar: raise ValueError("Falta FC de Limiar (LTHR).")
             lt = req.fc_limiar
+            # Metodologia Oficial de Joe Friel (Training and Racing with a Power Meter)
             zonas = [
-                {"id": 1, "nome": "Z1 - Recuperação", "min": int(lt * 0.65), "max": int(lt * 0.84), "cor": "bg-gray-500", "desc": "Trote Leve / Regenerativo"},
-                {"id": 2, "nome": "Z2 - Aeróbico Base", "min": int(lt * 0.85), "max": int(lt * 0.89), "cor": "bg-blue-500", "desc": "Resistência / Longão"},
-                {"id": 3, "nome": "Z3 - Tempo Run", "min": int(lt * 0.90), "max": int(lt * 0.94), "cor": "bg-emerald-500", "desc": "Ritmo Constante"},
-                {"id": 4, "nome": "Z4 - Limiar", "min": int(lt * 0.95), "max": int(lt * 0.99), "cor": "bg-orange-500", "desc": "No Limite do Ácido Lático"},
-                {"id": 5, "nome": "Z5 - Anaeróbico", "min": lt, "max": int(lt * 1.05), "cor": "bg-red-500", "desc": "Acima do Limiar / Explosão"},
+                {"id": 1, "nome": "Z1 - Recuperação", "min": int(lt * 0.65), "max": int(lt * 0.84), "tema": "cinza", "desc": "Regenerativo (<85% LTHR)"},
+                {"id": 2, "nome": "Z2 - Base Aeróbica", "min": int(lt * 0.85), "max": int(lt * 0.89), "tema": "azul", "desc": "Resistência (85-89% LTHR)"},
+                {"id": 3, "nome": "Z3 - Tempo", "min": int(lt * 0.90), "max": int(lt * 0.94), "tema": "verde", "desc": "Ritmo Constante (90-94% LTHR)"},
+                {"id": 4, "nome": "Z4 - Limiar de Lactato", "min": int(lt * 0.95), "max": int(lt * 0.99), "tema": "laranja", "desc": "No Limite do Ácido (95-99% LTHR)"},
+                {"id": 5, "nome": "Z5 - Anaeróbico", "min": lt, "max": int(lt * 1.05), "tema": "vermelho", "desc": "Explosão / VO2 (>100% LTHR)"},
             ]
         else:
-            raise ValueError("Metodologia inválida")
+            raise ValueError("Metodologia inválida.")
+        
+        # Persistência OBRIGATÓRIA no Banco
+        fisiologia_data = {
+            "metodo": req.metodo,
+            "fc_max": req.fc_max,
+            "fc_repouso": req.fc_repouso,
+            "fc_limiar": req.fc_limiar,
+            "zonas": zonas
+        }
+        supabase.table("usuarios_strava").update({"fisiologia_json": fisiologia_data}).eq("id", strava_id).execute()
             
-        return {"status": "success", "zonas": zonas}
+        return {"status": "success", "zonas": zonas, "fisiologia_salva": fisiologia_data}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/fisiologia/extrair-limiar/{strava_id}/{activity_id}")
 def extrair_limiar_de_prova(strava_id: int, activity_id: int):
-    """Padrão Ouro: Extrai a FC Média de uma prova real e estima o Limiar de Lactato."""
+    """Padrão Ouro (Friel): Estima o Limiar baseado no comportamento de provas extremas, com filtro de paradas."""
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     usuario = res_db.data[0]
     token = atualizar_token_strava(usuario['refresh_token'])
@@ -351,37 +374,58 @@ def extrair_limiar_de_prova(strava_id: int, activity_id: int):
     headers = {'Authorization': f'Bearer {token}'}
     res = requests.get(f"https://www.strava.com/api/v3/activities/{activity_id}", headers=headers)
     if res.status_code != 200: 
-        raise HTTPException(status_code=500, detail="Erro ao acessar detalhes da atividade no Strava.")
+        raise HTTPException(status_code=500, detail="Erro ao acessar telemetria no Strava.")
     
     dados = res.json()
     distancia_km = dados.get('distance', 0) / 1000.0
     bpm_medio = dados.get('average_heartrate', 0)
+    bpm_maximo = dados.get('max_heartrate', 0)
+    tempo_movimento = dados.get('moving_time', 0)
+    tempo_decorrido = dados.get('elapsed_time', 0)
     nome_prova = dados.get('name', 'Prova Oficial')
     
-    if bpm_medio == 0:
-        raise HTTPException(status_code=400, detail="Essa atividade não possui registros cardíacos (Fita/Relógio).")
+    if bpm_medio == 0 or bpm_maximo == 0:
+        raise HTTPException(status_code=400, detail="Esta atividade não possui registros cardíacos (cinta/relógio).")
         
-    fator_correcao = 1.0
+    # Análise de "Sujeira" nos dados: O atleta esqueceu o relógio ligado após a linha de chegada?
+    # Se o tempo total for 2 minutos (120s) maior que o tempo em movimento, a média de BPM caiu artificialmente.
+    dados_com_paradas = (tempo_decorrido - tempo_movimento) > 120 
     
-    # Lógica Biomecânica baseada no Tempo de Exposição (Friel)
-    # Uma prova de 5k é corrida ACIMA do limiar. Uma de 10k é corrida NO limiar (esforço de ~45min-1h)
+    # Lógica de Joe Friel para Estimativa de Limiar (LTHR)
     if 4.5 <= distancia_km <= 5.5:
-        fator_correcao = 0.95  # Reduz 5% do BPM médio pois o 5k é supra-limiar
+        # Uma prova de 5k é corrida ACIMA do limiar (esforço de ~20-30 min).
+        if dados_com_paradas and bpm_maximo > 120:
+            limiar_estimado = int(bpm_maximo * 0.92)
+            metodo_usado = "92% da FC Máxima da prova (Compensação por paradas identificadas)"
+        else:
+            limiar_estimado = int(bpm_medio * 0.95)
+            metodo_usado = "95% da FC Média do 5k (Protocolo Joe Friel)"
+            
     elif 9.5 <= distancia_km <= 10.5:
-        fator_correcao = 1.00  # O BPM médio do 10k é a tradução perfeita do Limiar
+        # Uma prova de 10k reflete o limiar exato (esforço de ~45-60 min).
+        if dados_com_paradas and bpm_maximo > 120:
+            limiar_estimado = int(bpm_maximo * 0.90)
+            metodo_usado = "90% da FC Máxima da prova (Compensação por paradas identificadas)"
+        else:
+            limiar_estimado = int(bpm_medio)
+            metodo_usado = "100% da FC Média bruta do 10k"
+            
     elif 20.0 <= distancia_km <= 22.0:
-        fator_correcao = 1.05  # A Meia é corrida abaixo do limiar
-    else:
-        # Se for uma distância estranha, assume o BPM bruto, mas o fator mantém 1.0
-        fator_correcao = 1.00
+        # A Meia Maratona é corrida abaixo do limiar
+        limiar_estimado = int(bpm_medio * 1.05)
+        metodo_usado = "105% da FC Média da Meia Maratona"
         
-    limiar_estimado = int(bpm_medio * fator_correcao)
+    else:
+        # Distâncias arbitrárias assumem a média, mas alertam o atleta.
+        limiar_estimado = int(bpm_medio)
+        metodo_usado = "FC Média bruta da atividade (Ideal usar 5k ou 10k)"
     
     return {
         "status": "success", 
         "limiar_estimado": limiar_estimado, 
         "bpm_medio_real": bpm_medio,
+        "bpm_max_real": bpm_maximo,
         "distancia_km": round(distancia_km, 2),
-        "fator_correcao": fator_correcao,
+        "metodo_usado": metodo_usado,
         "nome_prova": nome_prova
     }
