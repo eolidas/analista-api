@@ -13,7 +13,7 @@ from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 2.1.3 - Anti-Cold Start (Keep-Alive DB)
+# Versão: 3.0.0 - Motor de Zonas Fisiológicas & Limiar
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -50,6 +50,13 @@ class BiometriaRequest(BaseModel):
 
 class TrofeusRequest(BaseModel):
     somente_provas: bool
+
+# --- NOVO: Módulo Fisiológico ---
+class ConfigZonas(BaseModel):
+    metodo: str  # 'max', 'karvonen', 'limiar'
+    fc_max: Optional[int] = None
+    fc_repouso: Optional[int] = None
+    fc_limiar: Optional[int] = None
 
 # ==========================================
 # ⚙️ FUNÇÕES DE ENGENHARIA DE DADOS
@@ -110,26 +117,12 @@ def construir_perfil_seguro(dados_db: dict) -> dict:
     }
 
 # ==========================================
-# 🌐 ROTAS DA API
+# 🌐 ROTAS DA API - OAUTH & SINCRONIZAÇÃO
 # ==========================================
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "2.1.3"}
-
-@app.get("/keep-alive")
-def manter_acordado():
-    """
-    Rota tática para o UptimeRobot bater. 
-    Faz uma micro-consulta no banco para manter o pool de conexões do Supabase quente,
-    eliminando a lentidão do primeiro carregamento do app.
-    """
-    try:
-        # Traz apenas 1 ID do banco, o mínimo possível só para forçar atividade na rede
-        supabase.table("usuarios_strava").select("id").limit(1).execute()
-        return {"status": "Motor e Banco de Dados 100% Quentes! 🔥"}
-    except Exception as e:
-        return {"status": "Motor acordado, mas banco falhou.", "erro": str(e)}
+    return {"status": "Motor V8 Operante 🚀", "version": "3.0.0"}
 
 @app.post("/auth/strava")
 def autenticar_usuario(requisicao: StravaAuthRequest):
@@ -147,10 +140,7 @@ def autenticar_usuario(requisicao: StravaAuthRequest):
     res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
     atleta = res_perfil.json() if res_perfil.status_code == 200 else atleta_resumo
     
-    equipamentos = {
-        "tenis": atleta.get('shoes') or [], 
-        "bicicletas": atleta.get('bikes') or []
-    }
+    equipamentos = {"tenis": atleta.get('shoes') or [], "bicicletas": atleta.get('bikes') or []}
     clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in (atleta.get('clubs') or [])]
     
     upsert_data = {
@@ -191,22 +181,14 @@ def sincronizar_e_atualizar(strava_id: int):
     token_fresco = atualizar_token_strava(atleta_db['refresh_token'])
     headers = {'Authorization': f'Bearer {token_fresco}'}
     
-    # ==========================================
-    # RESTAURAÇÃO: SINCRONIZAR PERFIL COMPLETO
-    # ==========================================
     res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
-    
-    perfil_atualizado_frontend = {} # Opcional para devolver ao frontend
+    perfil_atualizado_frontend = {}
     if res_perfil.status_code == 200:
         s = res_perfil.json()
         equipamentos = {"tenis": s.get('shoes') or [], "bicicletas": s.get('bikes') or []}
         clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in (s.get('clubs') or [])]
         
-        # Blindagem: Só sobreescrevemos se os dados não vierem nulos da API
-        perfil_upd = {
-            "equipamentos": equipamentos, 
-            "clubes": clubes, 
-        }
+        perfil_upd = {"equipamentos": equipamentos, "clubes": clubes}
         if s.get('city'): perfil_upd["cidade"] = s.get('city')
         if s.get('state'): perfil_upd["estado"] = s.get('state')
         if s.get('sex'): perfil_upd["genero"] = s.get('sex')
@@ -216,9 +198,6 @@ def sincronizar_e_atualizar(strava_id: int):
         supabase.table("usuarios_strava").update(perfil_upd).eq("id", strava_id).execute()
         perfil_atualizado_frontend = perfil_upd
 
-    # ==========================================
-    # VARREDURA ABSOLUTA DE TREINOS
-    # ==========================================
     url_activities = 'https://www.strava.com/api/v3/athlete/activities'
     treinos_brutos = []
     pagina = 1
@@ -226,18 +205,19 @@ def sincronizar_e_atualizar(strava_id: int):
     while True:
         res_strava = requests.get(url_activities, headers=headers, params={'per_page': 200, 'page': pagina})
         if res_strava.status_code != 200: raise HTTPException(status_code=500, detail="Falha na API Strava.")
-        
         dados = res_strava.json()
         if not dados: break 
-        
         treinos_brutos.extend(dados)
         if len(dados) < 200: break
         pagina += 1
         
     lista_final = formatar_atividades_para_banco(treinos_brutos)
-    
     supabase.table("usuarios_strava").update({"historico_json": lista_final}).eq("id", strava_id).execute()
     return {"status": "success", "historico_json": lista_final, "perfil_atualizado": perfil_atualizado_frontend}
+
+# ==========================================
+# 🌐 ROTAS DA API - IA & TROFÉUS
+# ==========================================
 
 @app.post("/trofeus/garimpar/{strava_id}")
 def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
@@ -254,7 +234,6 @@ def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
 
     headers = {'Authorization': f'Bearer {token}'}
     distancias_mapa = {"1k": "1k", "5k": "5k", "10k": "10k", "half marathon": "Half Marathon", "marathon": "Marathon"}
-    
     trofeus_renovados = {} 
     
     for prova in provas:
@@ -269,7 +248,6 @@ def garimpar_recordes_pessoais(strava_id: int, req: TrofeusRequest):
             if nome_clean in distancias_mapa:
                 chave = distancias_mapa[nome_clean]
                 tempo_segundos = effort.get('elapsed_time')
-                
                 atual = trofeus_renovados.get(chave)
                 
                 if not atual or tempo_segundos < atual['tempo_segundos']:
@@ -310,3 +288,100 @@ def atualizar_biometria(strava_id: int, req: BiometriaRequest):
     upd = {k: v for k, v in req.dict().items() if v is not None}
     if upd: supabase.table("usuarios_strava").update(upd).eq("id", strava_id).execute()
     return {"status": "success"}
+
+# ==========================================
+# 🌐 ROTAS DA API - FISIOLOGIA (NOVO)
+# ==========================================
+
+@app.post("/fisiologia/calcular-zonas")
+def calcular_zonas_cardiacas(req: ConfigZonas):
+    """Motor de cálculo fisiológico. Suporta 3 metodologias oficiais."""
+    zonas = []
+    
+    try:
+        if req.metodo == 'max':
+            if not req.fc_max: raise ValueError("Falta FC Máxima")
+            # Metodologia Base: Porcentagem simples da Máxima
+            zonas = [
+                {"id": 1, "nome": "Z1 - Recuperação", "min": int(req.fc_max * 0.50), "max": int(req.fc_max * 0.59), "cor": "bg-gray-500", "desc": "Trote Leve / Regenerativo"},
+                {"id": 2, "nome": "Z2 - Aeróbico Base", "min": int(req.fc_max * 0.60), "max": int(req.fc_max * 0.69), "cor": "bg-blue-500", "desc": "Resistência / Longão"},
+                {"id": 3, "nome": "Z3 - Tempo Run", "min": int(req.fc_max * 0.70), "max": int(req.fc_max * 0.79), "cor": "bg-emerald-500", "desc": "Ritmo de Maratona"},
+                {"id": 4, "nome": "Z4 - Limiar", "min": int(req.fc_max * 0.80), "max": int(req.fc_max * 0.89), "cor": "bg-orange-500", "desc": "Pace de 10k / Desconfortável"},
+                {"id": 5, "nome": "Z5 - Anaeróbico", "min": int(req.fc_max * 0.90), "max": req.fc_max, "cor": "bg-red-500", "desc": "Tiros / Esforço Máximo"},
+            ]
+            
+        elif req.metodo == 'karvonen':
+            if not req.fc_max or not req.fc_repouso: raise ValueError("Falta FC Máxima ou de Repouso")
+            # Metodologia Karvonen: Frequência Cardíaca de Reserva (FCR)
+            fcr = req.fc_max - req.fc_repouso
+            def calc_karvonen(perc): return int((fcr * perc) + req.fc_repouso)
+            zonas = [
+                {"id": 1, "nome": "Z1 - Recuperação", "min": calc_karvonen(0.50), "max": calc_karvonen(0.59), "cor": "bg-gray-500", "desc": "Trote Leve / Regenerativo"},
+                {"id": 2, "nome": "Z2 - Aeróbico Base", "min": calc_karvonen(0.60), "max": calc_karvonen(0.69), "cor": "bg-blue-500", "desc": "Resistência / Longão"},
+                {"id": 3, "nome": "Z3 - Tempo Run", "min": calc_karvonen(0.70), "max": calc_karvonen(0.79), "cor": "bg-emerald-500", "desc": "Ritmo de Maratona"},
+                {"id": 4, "nome": "Z4 - Limiar", "min": calc_karvonen(0.80), "max": calc_karvonen(0.89), "cor": "bg-orange-500", "desc": "Pace de 10k / Desconfortável"},
+                {"id": 5, "nome": "Z5 - Anaeróbico", "min": calc_karvonen(0.90), "max": req.fc_max, "cor": "bg-red-500", "desc": "Tiros / Esforço Máximo"},
+            ]
+            
+        elif req.metodo == 'limiar':
+            if not req.fc_limiar: raise ValueError("Falta FC de Limiar (LTHR)")
+            # Metodologia Joe Friel: Baseada no Ponto de Limiar de Lactato
+            lt = req.fc_limiar
+            zonas = [
+                {"id": 1, "nome": "Z1 - Recuperação", "min": int(lt * 0.65), "max": int(lt * 0.84), "cor": "bg-gray-500", "desc": "Trote Leve / Regenerativo"},
+                {"id": 2, "nome": "Z2 - Aeróbico Base", "min": int(lt * 0.85), "max": int(lt * 0.89), "cor": "bg-blue-500", "desc": "Resistência / Longão"},
+                {"id": 3, "nome": "Z3 - Tempo Run", "min": int(lt * 0.90), "max": int(lt * 0.94), "cor": "bg-emerald-500", "desc": "Ritmo Constante"},
+                {"id": 4, "nome": "Z4 - Limiar", "min": int(lt * 0.95), "max": int(lt * 0.99), "cor": "bg-orange-500", "desc": "No Limite do Ácido Lático"},
+                {"id": 5, "nome": "Z5 - Anaeróbico", "min": lt, "max": int(lt * 1.05), "cor": "bg-red-500", "desc": "Acima do Limiar / Explosão"},
+            ]
+        else:
+            raise ValueError("Metodologia inválida")
+            
+        return {"status": "success", "zonas": zonas}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/fisiologia/extrair-limiar/{strava_id}/{activity_id}")
+def extrair_limiar_de_prova(strava_id: int, activity_id: int):
+    """Padrão Ouro: Extrai a FC Média de uma prova real e estima o Limiar de Lactato."""
+    res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
+    usuario = res_db.data[0]
+    token = atualizar_token_strava(usuario['refresh_token'])
+    
+    headers = {'Authorization': f'Bearer {token}'}
+    res = requests.get(f"https://www.strava.com/api/v3/activities/{activity_id}", headers=headers)
+    if res.status_code != 200: 
+        raise HTTPException(status_code=500, detail="Erro ao acessar detalhes da atividade no Strava.")
+    
+    dados = res.json()
+    distancia_km = dados.get('distance', 0) / 1000.0
+    bpm_medio = dados.get('average_heartrate', 0)
+    nome_prova = dados.get('name', 'Prova Oficial')
+    
+    if bpm_medio == 0:
+        raise HTTPException(status_code=400, detail="Essa atividade não possui registros cardíacos (Fita/Relógio).")
+        
+    fator_correcao = 1.0
+    
+    # Lógica Biomecânica baseada no Tempo de Exposição (Friel)
+    # Uma prova de 5k é corrida ACIMA do limiar. Uma de 10k é corrida NO limiar (esforço de ~45min-1h)
+    if 4.5 <= distancia_km <= 5.5:
+        fator_correcao = 0.95  # Reduz 5% do BPM médio pois o 5k é supra-limiar
+    elif 9.5 <= distancia_km <= 10.5:
+        fator_correcao = 1.00  # O BPM médio do 10k é a tradução perfeita do Limiar
+    elif 20.0 <= distancia_km <= 22.0:
+        fator_correcao = 1.05  # A Meia é corrida abaixo do limiar
+    else:
+        # Se for uma distância estranha, assume o BPM bruto, mas o fator mantém 1.0
+        fator_correcao = 1.00
+        
+    limiar_estimado = int(bpm_medio * fator_correcao)
+    
+    return {
+        "status": "success", 
+        "limiar_estimado": limiar_estimado, 
+        "bpm_medio_real": bpm_medio,
+        "distancia_km": round(distancia_km, 2),
+        "fator_correcao": fator_correcao,
+        "nome_prova": nome_prova
+    }
