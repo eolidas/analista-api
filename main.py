@@ -13,7 +13,7 @@ from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 3.1.0 - Motor Fisiológico Avançado (Joe Friel & Tanaka)
+# Versão: 3.2.0 - Extração de Limiar via STREAMS (Padrão Ouro Friel)
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -94,7 +94,6 @@ def formatar_atividades_para_banco(lista_bruta):
     
     colunas_finais = ['id', 'type', 'workout_type', 'name', 'distancia_km', 'Pace_Medio', 'average_heartrate', 'max_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local', 'elapsed_time']
     
-    # Tratamento caso elapsed_time não exista em alguma atividade antiga
     if 'elapsed_time' not in df.columns:
         df['elapsed_time'] = df['moving_time']
         
@@ -119,7 +118,7 @@ def construir_perfil_seguro(dados_db: dict) -> dict:
         "data_criacao": dados_db.get("data_criacao") or "",
         "clubes": dados_db.get("clubes") or [],
         "equipamentos": equip,
-        "fisiologia": dados_db.get("fisiologia_json") or {}
+        "fisiologia": dados_db.get("fisiologia_json") or {} 
     }
 
 # ==========================================
@@ -128,7 +127,7 @@ def construir_perfil_seguro(dados_db: dict) -> dict:
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "3.1.0"}
+    return {"status": "Motor V8 Operante 🚀", "version": "3.2.0"}
 
 @app.get("/keep-alive")
 def manter_acordado():
@@ -304,18 +303,16 @@ def atualizar_biometria(strava_id: int, req: BiometriaRequest):
     return {"status": "success"}
 
 # ==========================================
-# 🌐 ROTAS DA API - FISIOLOGIA (ZONAS E LIMIAR)
+# 🌐 ROTAS DA API - FISIOLOGIA (ZONAS E LIMIAR VIA STREAMS)
 # ==========================================
 
 @app.post("/fisiologia/calcular-zonas/{strava_id}")
 def calcular_zonas_cardiacas(strava_id: int, req: ConfigZonas):
     """Motor de cálculo fisiológico com rigor científico (Friel, ACSM, Karvonen)."""
     zonas = []
-    
     try:
         if req.metodo == 'max':
             if not req.fc_max: raise ValueError("FC Máxima não informada.")
-            # Zonas clássicas (ACSM - American College of Sports Medicine)
             zonas = [
                 {"id": 1, "nome": "Z1 - Recuperação", "min": int(req.fc_max * 0.50), "max": int(req.fc_max * 0.59), "tema": "cinza", "desc": "Aquecimento / Regenerativo"},
                 {"id": 2, "nome": "Z2 - Aeróbico", "min": int(req.fc_max * 0.60), "max": int(req.fc_max * 0.69), "tema": "azul", "desc": "Resistência Base / Longão"},
@@ -323,7 +320,6 @@ def calcular_zonas_cardiacas(strava_id: int, req: ConfigZonas):
                 {"id": 4, "nome": "Z4 - Limiar", "min": int(req.fc_max * 0.80), "max": int(req.fc_max * 0.89), "tema": "laranja", "desc": "Pace de 10k / Desconfortável"},
                 {"id": 5, "nome": "Z5 - Anaeróbico", "min": int(req.fc_max * 0.90), "max": req.fc_max, "tema": "vermelho", "desc": "Tiros / Esforço Máximo"},
             ]
-            
         elif req.metodo == 'karvonen':
             if not req.fc_max or not req.fc_repouso: raise ValueError("Falta FC Máxima ou de Repouso.")
             fcr = req.fc_max - req.fc_repouso
@@ -335,11 +331,9 @@ def calcular_zonas_cardiacas(strava_id: int, req: ConfigZonas):
                 {"id": 4, "nome": "Z4 - Limiar", "min": calc_karvonen(0.80), "max": calc_karvonen(0.89), "tema": "laranja", "desc": "Pace de 10k / Desconfortável"},
                 {"id": 5, "nome": "Z5 - Anaeróbico", "min": calc_karvonen(0.90), "max": req.fc_max, "tema": "vermelho", "desc": "Tiros / Esforço Máximo"},
             ]
-            
         elif req.metodo == 'limiar':
             if not req.fc_limiar: raise ValueError("Falta FC de Limiar (LTHR).")
             lt = req.fc_limiar
-            # Metodologia Oficial de Joe Friel (Training and Racing with a Power Meter)
             zonas = [
                 {"id": 1, "nome": "Z1 - Recuperação", "min": int(lt * 0.65), "max": int(lt * 0.84), "tema": "cinza", "desc": "Regenerativo (<85% LTHR)"},
                 {"id": 2, "nome": "Z2 - Base Aeróbica", "min": int(lt * 0.85), "max": int(lt * 0.89), "tema": "azul", "desc": "Resistência (85-89% LTHR)"},
@@ -350,82 +344,88 @@ def calcular_zonas_cardiacas(strava_id: int, req: ConfigZonas):
         else:
             raise ValueError("Metodologia inválida.")
         
-        # Persistência OBRIGATÓRIA no Banco
-        fisiologia_data = {
-            "metodo": req.metodo,
-            "fc_max": req.fc_max,
-            "fc_repouso": req.fc_repouso,
-            "fc_limiar": req.fc_limiar,
-            "zonas": zonas
-        }
+        fisiologia_data = {"metodo": req.metodo, "fc_max": req.fc_max, "fc_repouso": req.fc_repouso, "fc_limiar": req.fc_limiar, "zonas": zonas}
         supabase.table("usuarios_strava").update({"fisiologia_json": fisiologia_data}).eq("id", strava_id).execute()
-            
         return {"status": "success", "zonas": zonas, "fisiologia_salva": fisiologia_data}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/fisiologia/extrair-limiar/{strava_id}/{activity_id}")
 def extrair_limiar_de_prova(strava_id: int, activity_id: int):
-    """Padrão Ouro (Friel): Estima o Limiar baseado no comportamento de provas extremas, com filtro de paradas."""
+    """
+    Motor Científico: Puxa Streams do Strava, descarta a rampa de aquecimento (1.5km) 
+    e extrai o verdadeiro Limiar estabilizado usando a matemática de Joe Friel.
+    """
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     usuario = res_db.data[0]
     token = atualizar_token_strava(usuario['refresh_token'])
     
     headers = {'Authorization': f'Bearer {token}'}
-    res = requests.get(f"https://www.strava.com/api/v3/activities/{activity_id}", headers=headers)
-    if res.status_code != 200: 
+    res_atividade = requests.get(f"https://www.strava.com/api/v3/activities/{activity_id}", headers=headers)
+    
+    if res_atividade.status_code != 200: 
         raise HTTPException(status_code=500, detail="Erro ao acessar telemetria no Strava.")
     
-    dados = res.json()
+    dados = res_atividade.json()
     distancia_km = dados.get('distance', 0) / 1000.0
-    bpm_medio = dados.get('average_heartrate', 0)
-    bpm_maximo = dados.get('max_heartrate', 0)
-    tempo_movimento = dados.get('moving_time', 0)
-    tempo_decorrido = dados.get('elapsed_time', 0)
+    bpm_medio_geral = dados.get('average_heartrate', 0)
     nome_prova = dados.get('name', 'Prova Oficial')
     
-    if bpm_medio == 0 or bpm_maximo == 0:
+    if bpm_medio_geral == 0:
         raise HTTPException(status_code=400, detail="Esta atividade não possui registros cardíacos (cinta/relógio).")
-        
-    # Análise de "Sujeira" nos dados: O atleta esqueceu o relógio ligado após a linha de chegada?
-    # Se o tempo total for 2 minutos (120s) maior que o tempo em movimento, a média de BPM caiu artificialmente.
-    dados_com_paradas = (tempo_decorrido - tempo_movimento) > 120 
+
+    # ==========================================
+    # ANÁLISE DE STREAMS (SEGUNDO A SEGUNDO)
+    # ==========================================
+    url_streams = f"https://www.strava.com/api/v3/activities/{activity_id}/streams?keys=heartrate,distance&key_by_type=true"
+    res_streams = requests.get(url_streams, headers=headers)
     
-    # Lógica de Joe Friel para Estimativa de Limiar (LTHR)
+    bpm_base_calculo = bpm_medio_geral
+    usou_streams = False
+    
+    if res_streams.status_code == 200:
+        streams = res_streams.json()
+        if 'heartrate' in streams and 'distance' in streams:
+            hr_data = streams['heartrate']['data']
+            dist_data = streams['distance']['data']
+            
+            # Protocolo Ouro: Descartar os primeiros 1.500m (fase de rampa de aquecimento cardíaca)
+            hr_isolado = [hr for hr, d in zip(hr_data, dist_data) if d > 1500]
+            
+            if hr_isolado:
+                bpm_base_calculo = sum(hr_isolado) / len(hr_isolado)
+                usou_streams = True
+
+    # ==========================================
+    # MATEMÁTICA DE COMPENSAÇÃO (JOE FRIEL)
+    # ==========================================
     if 4.5 <= distancia_km <= 5.5:
-        # Uma prova de 5k é corrida ACIMA do limiar (esforço de ~20-30 min).
-        if dados_com_paradas and bpm_maximo > 120:
-            limiar_estimado = int(bpm_maximo * 0.92)
-            metodo_usado = "92% da FC Máxima da prova (Compensação por paradas identificadas)"
+        fator = 1.05
+        limiar_estimado = int(bpm_base_calculo / fator)
+        if usou_streams:
+            detalhe_metodo = f"• Análise de Streams (Segundo a Segundo)\n• Primeiros 1.5km (Rampa/Aquecimento) foram descartados.\n• FC Média do Trecho Estabilizado: {int(bpm_base_calculo)} bpm\n• Esforço de 5k é supra-limiar, portanto dividimos a média por {fator}."
         else:
-            limiar_estimado = int(bpm_medio * 0.95)
-            metodo_usado = "95% da FC Média do 5k (Protocolo Joe Friel)"
+            detalhe_metodo = f"• Análise de Resumo (Sem Streams)\n• FC Média Geral: {int(bpm_base_calculo)} bpm\n• Esforço de 5k dividido por {fator}."
             
     elif 9.5 <= distancia_km <= 10.5:
-        # Uma prova de 10k reflete o limiar exato (esforço de ~45-60 min).
-        if dados_com_paradas and bpm_maximo > 120:
-            limiar_estimado = int(bpm_maximo * 0.90)
-            metodo_usado = "90% da FC Máxima da prova (Compensação por paradas identificadas)"
+        fator = 1.00
+        limiar_estimado = int(bpm_base_calculo / fator)
+        if usou_streams:
+            detalhe_metodo = f"• Análise de Streams (Segundo a Segundo)\n• Primeiros 1.5km descartados.\n• FC Média do Trecho = Seu Limiar Direto: {int(bpm_base_calculo)} bpm."
         else:
-            limiar_estimado = int(bpm_medio)
-            metodo_usado = "100% da FC Média bruta do 10k"
+            detalhe_metodo = f"• FC Média Geral: {int(bpm_base_calculo)} bpm\n• O esforço médio de um 10k reflete o Limiar Direto."
             
     elif 20.0 <= distancia_km <= 22.0:
-        # A Meia Maratona é corrida abaixo do limiar
-        limiar_estimado = int(bpm_medio * 1.05)
-        metodo_usado = "105% da FC Média da Meia Maratona"
-        
+        fator = 1.05
+        limiar_estimado = int(bpm_base_calculo * fator)
+        detalhe_metodo = f"• FC Média do Trecho: {int(bpm_base_calculo)} bpm\n• A Meia Maratona é corrida abaixo do limiar (Fator Multiplicador aplicado)."
     else:
-        # Distâncias arbitrárias assumem a média, mas alertam o atleta.
-        limiar_estimado = int(bpm_medio)
-        metodo_usado = "FC Média bruta da atividade (Ideal usar 5k ou 10k)"
+        limiar_estimado = int(bpm_base_calculo)
+        detalhe_metodo = f"• Distância atípica para teste. Usada FC Média Bruta do trecho ({int(bpm_base_calculo)} bpm)."
     
     return {
         "status": "success", 
         "limiar_estimado": limiar_estimado, 
-        "bpm_medio_real": bpm_medio,
-        "bpm_max_real": bpm_maximo,
-        "distancia_km": round(distancia_km, 2),
-        "metodo_usado": metodo_usado,
+        "metodo_usado": detalhe_metodo,
         "nome_prova": nome_prova
     }
