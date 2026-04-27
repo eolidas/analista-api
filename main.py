@@ -6,14 +6,14 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 4.3.0 - Módulo de Zonas de Ritmo (Jack Daniels & Friel)
+# Versão: 5.0.0 - Módulo Master Coach (Text-to-Plan Parser)
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -63,9 +63,20 @@ class ConfigZonasPace(BaseModel):
     distancia_km: Optional[float] = None
     tempo_segundos: Optional[int] = None
     pace_limiar: Optional[str] = None # Ex: "05:00"
+    altitude_m: Optional[float] = None
+    temperatura_c: Optional[float] = None
 
 class ExtrairLimiarMultiRequest(BaseModel):
     activities: list[int]
+    compensar_temp: bool = True
+    compensar_alt: bool = True
+
+# --- Master Coach (Text-to-Plan) ---
+class ParseTreinoRequest(BaseModel):
+    strava_id: int
+    data_treino: str # Formato YYYY-MM-DD
+    texto_bruto: str
+    ciclo_id: Optional[str] = None
 
 # ==========================================
 # ⚙️ FUNÇÕES DE ENGENHARIA DE DADOS E CONVERSÃO
@@ -159,7 +170,7 @@ def pace_str_to_seg(pace_str):
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "4.3.0"}
+    return {"status": "Motor V8 Operante 🚀", "version": "5.0.0"}
 
 @app.post("/auth/strava")
 def autenticar_usuario(requisicao: StravaAuthRequest):
@@ -249,7 +260,81 @@ def sincronizar_e_atualizar(strava_id: int):
     return {"status": "success", "historico_json": lista_final}
 
 # ==========================================
-# 🌐 ROTAS DA API - IA & TROFÉUS
+# 🌐 ROTAS DA API - IA MASTER COACH & PARSING
+# ==========================================
+
+@app.post("/treinos/parse")
+def parse_treino_texto(req: ParseTreinoRequest):
+    """
+    O Cérebro do Master Coach: Pega um texto livre do atleta e estrutura
+    via Gemini num JSON matemático rígido para o Calendário.
+    """
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        prompt = f"""
+        Atue como um treinador de corrida de elite e cientista de dados. 
+        Analise o seguinte texto digitado pelo atleta (planejamento de treino):
+        "{req.texto_bruto}"
+
+        Retorne ESTRITAMENTE um objeto JSON válido (sem tags markdown de código, apenas as chaves/valores) com este formato exato:
+        {{
+            "descricao_limpa": "string (um resumo limpo e encorajador de 1 linha sobre o objetivo do treino)",
+            "distancia_estimada_km": float (calcule a soma matemática de todas as distâncias descritas. Ex: aquece 3k + 10x400m + solta 2k = 9.0. Use 0.0 se não for possível deduzir),
+            "blocos": [
+                {{
+                    "tipo": "string (opções estritas: 'aquecimento', 'principal', 'tiro', 'soltura', 'recuperacao')",
+                    "repeticoes": int (padrão 1, mas se for 10x400, aqui é 10),
+                    "distancia_metros": int (ex: 400. Se for por tempo, coloque null),
+                    "tempo_minutos": int (opcional, null se for por distância),
+                    "intensidade_alvo": "string (Ex: 'Z2', 'Pace Maratona', 'Forte', 'Leve')"
+                }}
+            ]
+        }}
+        """
+
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+        )
+        
+        # Garante que a IA retornou JSON válido
+        estrutura_json = json.loads(response.text)
+        
+        # Upsert Inteligente (Proteção contra duplicatas no mesmo dia)
+        res_busca = supabase.table("calendario_treinos").select("id").eq("strava_id", req.strava_id).eq("data_treino", req.data_treino).execute()
+        
+        payload_db = {
+            "strava_id": req.strava_id,
+            "data_treino": req.data_treino,
+            "texto_bruto": req.texto_bruto,
+            "estrutura_json": estrutura_json,
+            "status": "planejado"
+        }
+        if req.ciclo_id:
+            payload_db["ciclo_id"] = req.ciclo_id
+
+        if res_busca.data and len(res_busca.data) > 0:
+            # Se já havia um treino neste dia, ele atualiza (edição de treino)
+            id_treino = res_busca.data[0]['id']
+            supabase.table("calendario_treinos").update(payload_db).eq("id", id_treino).execute()
+            acao = "atualizado"
+        else:
+            # Novo agendamento
+            supabase.table("calendario_treinos").insert(payload_db).execute()
+            acao = "inserido"
+            
+        return {"status": "success", "acao": acao, "dados_parseados": estrutura_json}
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="A Inteligência Artificial falhou em gerar um modelo de dados estruturado.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao interpretar o treino: {str(e)}")
+
+# ==========================================
+# 🌐 ROTAS DA API - IA DIAGNÓSTICO & TROFÉUS
 # ==========================================
 
 @app.post("/trofeus/garimpar/{strava_id}")
@@ -327,7 +412,6 @@ def atualizar_biometria(strava_id: int, req: BiometriaRequest):
 
 @app.post("/fisiologia/calcular-zonas/{strava_id}")
 def calcular_zonas_cardiacas(strava_id: int, req: ConfigZonasFC):
-    """Calcula Zonas de FC (Batimentos) e mescla com os dados de Ritmo já existentes no Banco."""
     try:
         if req.metodo == 'max':
             if not req.fc_max: raise ValueError("FC Máxima não informada.")
@@ -362,7 +446,6 @@ def calcular_zonas_cardiacas(strava_id: int, req: ConfigZonasFC):
         else:
             raise ValueError("Metodologia de FC inválida.")
         
-        # Merge Seguro: Preserva as configurações de Pace se existirem
         res_db = supabase.table("usuarios_strava").select("fisiologia_json").eq("id", strava_id).execute()
         fisiologia_atual = res_db.data[0].get("fisiologia_json") or {} if res_db.data else {}
         
@@ -382,15 +465,19 @@ def calcular_zonas_cardiacas(strava_id: int, req: ConfigZonasFC):
 
 @app.post("/fisiologia/calcular-zonas-pace/{strava_id}")
 def calcular_zonas_ritmo(strava_id: int, req: ConfigZonasPace):
-    """Novo Motor de Zonas de Ritmo (Pace) via Jack Daniels (VDOT) ou Joe Friel."""
     try:
         pace_limiar_seg = 0
         
-        # 1. Determinação do Limiar de Pace Base (em segundos)
         if req.metodo in ['daniels', 'friel']:
             if req.distancia_km and req.tempo_segundos:
-                # Usa Riegel para converter qualquer prova para o equivalente em 10k (Limiar)
-                t_10k_sec = req.tempo_segundos * ((10.0 / req.distancia_km) ** 1.06)
+                
+                tempo_ajustado = req.tempo_segundos
+                if req.altitude_m and req.altitude_m > 500:
+                    tempo_ajustado = tempo_ajustado * (1 - (((req.altitude_m - 500) / 1000) * 0.015))
+                if req.temperatura_c and req.temperatura_c > 20:
+                    tempo_ajustado = tempo_ajustado * (1 - (((req.temperatura_c - 20) / 5) * 0.015))
+
+                t_10k_sec = tempo_ajustado * ((10.0 / req.distancia_km) ** 1.06)
                 pace_limiar_seg = t_10k_sec / 10.0
             elif req.pace_limiar:
                 pace_limiar_seg = pace_str_to_seg(req.pace_limiar)
@@ -401,7 +488,6 @@ def calcular_zonas_ritmo(strava_id: int, req: ConfigZonasPace):
 
         zonas = []
         
-        # 2. Metodologia Jack Daniels (Aproximação Cinética)
         if req.metodo == 'daniels':
             zonas = [
                 {"id": 1, "nome": "Pace E (Fácil/Easy)", "min": seg_to_pace_str(pace_limiar_seg * 1.30), "max": seg_to_pace_str(pace_limiar_seg * 1.20), "tema": "cinza", "desc": "Aquecimento e Resistência Longa"},
@@ -411,7 +497,6 @@ def calcular_zonas_ritmo(strava_id: int, req: ConfigZonasPace):
                 {"id": 5, "nome": "Pace R (Repetição)", "min": seg_to_pace_str(pace_limiar_seg * 0.88), "max": seg_to_pace_str(pace_limiar_seg * 0.80), "tema": "vermelho", "desc": "Tiros de Velocidade Pura (Pista)"},
             ]
         
-        # 3. Metodologia Joe Friel (Pace Baseado no LT)
         elif req.metodo == 'friel':
             zonas = [
                 {"id": 1, "nome": "Z1 - Recuperação", "min": seg_to_pace_str(pace_limiar_seg * 1.40), "max": seg_to_pace_str(pace_limiar_seg * 1.29), "tema": "cinza", "desc": "Pace Regenerativo (Trote)"},
@@ -421,7 +506,6 @@ def calcular_zonas_ritmo(strava_id: int, req: ConfigZonasPace):
                 {"id": 5, "nome": "Z5 - Anaeróbico", "min": seg_to_pace_str(pace_limiar_seg * 0.98), "max": seg_to_pace_str(pace_limiar_seg * 0.85), "tema": "vermelho", "desc": "Sprint / Capacidade Anaeróbica"},
             ]
 
-        # Merge Seguro: Preserva as configurações de FC
         res_db = supabase.table("usuarios_strava").select("fisiologia_json").eq("id", strava_id).execute()
         fisiologia_atual = res_db.data[0].get("fisiologia_json") or {} if res_db.data else {}
         
@@ -430,7 +514,9 @@ def calcular_zonas_ritmo(strava_id: int, req: ConfigZonasPace):
             "pace_limiar": seg_to_pace_str(pace_limiar_seg),
             "zonas_pace": zonas,
             "dist_ref_pace": req.distancia_km,
-            "tempo_ref_pace": req.tempo_segundos
+            "tempo_ref_pace": req.tempo_segundos,
+            "pace_altitude": req.altitude_m,
+            "pace_temp": req.temperatura_c
         })
         
         supabase.table("usuarios_strava").update({"fisiologia_json": fisiologia_atual}).eq("id", strava_id).execute()
@@ -497,27 +583,29 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
             fator_correcao += 0.05
             logs.append("Distância (Meia): +5% Fator (Sub-limiar)")
             
-        elev_por_km = total_elevacao / distancia_km if distancia_km > 0 else 0
-        if elev_por_km > 20:
-            fator_correcao -= 0.02
-            logs.append("Elevação Alta (>20m/km): -2% Fator")
-        elif elev_por_km > 10:
-            fator_correcao -= 0.01
-            logs.append("Elevação Média (>10m/km): -1% Fator")
-            
-        avg_temp = dados.get('average_temp')
-        if avg_temp is not None:
-            if avg_temp >= 28:
-                fator_correcao -= 0.04
-                logs.append(f"Calor Extremo ({avg_temp}°C): -4% Fator (Termorregulação)")
-            elif avg_temp >= 24:
+        if req.compensar_alt:
+            elev_por_km = total_elevacao / distancia_km if distancia_km > 0 else 0
+            if elev_por_km > 20:
                 fator_correcao -= 0.02
-                logs.append(f"Calor Alto ({avg_temp}°C): -2% Fator")
+                logs.append("Elevação Alta (>20m/km): -2% Fator")
+            elif elev_por_km > 10:
+                fator_correcao -= 0.01
+                logs.append("Elevação Média (>10m/km): -1% Fator")
+            
+            elev_high = dados.get('elev_high')
+            if elev_high is not None and elev_high > 1500:
+                fator_correcao -= 0.03
+                logs.append(f"Altitude Extrema (>1500m): -3% Fator")
                 
-        elev_high = dados.get('elev_high')
-        if elev_high is not None and elev_high > 1500:
-            fator_correcao -= 0.03
-            logs.append(f"Altitude Extrema (>1500m): -3% Fator")
+        if req.compensar_temp:
+            avg_temp = dados.get('average_temp')
+            if avg_temp is not None:
+                if avg_temp >= 28:
+                    fator_correcao -= 0.04
+                    logs.append(f"Calor Extremo ({avg_temp}°C): -4% Fator (Termorregulação)")
+                elif avg_temp >= 24:
+                    fator_correcao -= 0.02
+                    logs.append(f"Calor Alto ({avg_temp}°C): -2% Fator")
             
         if not usou_streams and (4.5 <= distancia_km <= 5.5) and bpm_maximo > 140:
             lthr_prova = int(bpm_maximo * (0.92 - (1.0 - fator_correcao)))
