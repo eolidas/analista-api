@@ -13,7 +13,7 @@ from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 5.0.0 - Módulo Master Coach (Text-to-Plan Parser)
+# Versão: 5.1.0 - Módulo Master Coach (Read/Write)
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -170,7 +170,7 @@ def pace_str_to_seg(pace_str):
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "5.0.0"}
+    return {"status": "Motor V8 Operante 🚀", "version": "5.1.0"}
 
 @app.post("/auth/strava")
 def autenticar_usuario(requisicao: StravaAuthRequest):
@@ -262,6 +262,19 @@ def sincronizar_e_atualizar(strava_id: int):
 # ==========================================
 # 🌐 ROTAS DA API - IA MASTER COACH & PARSING
 # ==========================================
+
+@app.get("/treinos/calendario/{strava_id}")
+def obter_calendario_treinos(strava_id: int):
+    """
+    Recupera todos os treinos planejados do atleta para montar a prancheta visual (Calendário).
+    """
+    try:
+        # Busca no Supabase ordenado pela data do treino
+        res_db = supabase.table("calendario_treinos").select("*").eq("strava_id", strava_id).order("data_treino").execute()
+        treinos = res_db.data if res_db.data else []
+        return {"status": "success", "treinos": treinos}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar calendário: {str(e)}")
 
 @app.post("/treinos/parse")
 def parse_treino_texto(req: ParseTreinoRequest):
