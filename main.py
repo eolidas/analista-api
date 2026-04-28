@@ -15,10 +15,10 @@ from google.genai import types
 # =========================================================================
 # ANALISTA DE BOLSO - BACKEND DE ALTA PERFORMANCE (FastAPI)
 # Arquitetura Clean Code | Integrações: Strava, Supabase, Gemini, Spotify
-# V4.0 - Full Monolith Engine (Sem Mocks, Matemática Real)
+# V4.3 - Motor Expandido e Correções de DataFrame (FillNA Robustness)
 # =========================================================================
 
-app = FastAPI(title="Analista de Bolso API", version="4.0.0")
+app = FastAPI(title="Analista de Bolso API", version="4.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -135,14 +135,13 @@ def get_atleta(strava_id: int):
     
     user = res.data[0]
     
-    # Tenta puxar os diários de bordo salvos pelo usuário para anexar ao histórico
     diarios_map = {}
     try:
         res_diario = supabase.table("diario_treinos").select("*").eq("strava_id", str(strava_id)).execute()
         for d in res_diario.data:
             diarios_map[d['id_atividade_strava']] = d
     except:
-        pass # Falha não impeditiva
+        pass 
     
     return {
         "perfil": {
@@ -205,7 +204,6 @@ def sync_strava(strava_id: int):
     if not access_token:
         raise HTTPException(status_code=401, detail="Sessão do Strava expirada.")
 
-    # 1. Puxa Atividades
     url_acts = 'https://www.strava.com/api/v3/athlete/activities'
     headers = {'Authorization': f'Bearer {access_token}'}
     
@@ -213,45 +211,65 @@ def sync_strava(strava_id: int):
     page = 1
     while True:
         res = requests.get(url_acts, headers=headers, params={'per_page': 200, 'page': page})
-        if res.status_code != 200: break
+        if res.status_code != 200: 
+            break
         data = res.json()
-        if not data: break
+        if not data: 
+            break
         atividades.extend(data)
         page += 1
-        if page > 2: break # Limite de 400 treinos para otimizar servidor free
+        if page > 2: 
+            break # Limite de 400 treinos para otimizar servidor free
 
     if not atividades:
         return {"historico_json": []}
 
-    # 2. Pipeline de Dados (Pandas)
     df = pd.DataFrame(atividades)
     df = df[df['type'].isin(['Run', 'Walk', 'Hike'])].copy()
-    if df.empty: return {"historico_json": []}
+    
+    if df.empty: 
+        return {"historico_json": []}
 
     df['distancia_km'] = df['distance'] / 1000.0
 
     def calc_pace(linha):
-        if linha['distancia_km'] == 0: return "00:00"
+        if linha['distancia_km'] == 0: 
+            return "00:00"
         pace_dec = (linha['moving_time'] / 60) / linha['distancia_km']
         return f"{int(pace_dec):02d}:{int(round((pace_dec - int(pace_dec)) * 60)):02d}"
         
     df['Pace_Medio'] = df.apply(calc_pace, axis=1)
     
-    # Prevenção rigorosa contra NaN (Data Pollution) e preenchimento de colunas faltantes
-    df['average_heartrate'] = df['average_heartrate'].fillna(0) if 'average_heartrate' in df.columns else 0
-    df['max_heartrate'] = df['max_heartrate'].fillna(0) if 'max_heartrate' in df.columns else 0
+    # Restauração do formato estrito para evitar Data Pollution com NaNs
+    if 'average_heartrate' in df.columns:
+        df['average_heartrate'] = df['average_heartrate'].fillna(0)
+    else:
+        df['average_heartrate'] = 0
+        
+    if 'max_heartrate' in df.columns:
+        df['max_heartrate'] = df['max_heartrate'].fillna(0)
+    else:
+        df['max_heartrate'] = 0
+        
+    if 'average_cadence' in df.columns:
+        df['Cadence_SPM'] = (df['average_cadence'].fillna(0) * 2).round().astype(int)
+    else:
+        df['Cadence_SPM'] = 0
+        
+    if 'total_elevation_gain' in df.columns:
+        df['total_elevation_gain'] = df['total_elevation_gain'].fillna(0)
+    else:
+        df['total_elevation_gain'] = 0
     
-    # Bug da Cadência resolvido: Fillna antes da multiplicação
-    df['Cadence_SPM'] = (df['average_cadence'].fillna(0) * 2).round().astype(int) if 'average_cadence' in df.columns else 0
-    
-    df['total_elevation_gain'] = df['total_elevation_gain'].fillna(0) if 'total_elevation_gain' in df.columns else 0
-    
-    if 'elapsed_time' not in df.columns: df['elapsed_time'] = df['moving_time']
-    if 'start_latlng' not in df.columns: df['start_latlng'] = None
+    if 'elapsed_time' not in df.columns: 
+        df['elapsed_time'] = df['moving_time']
+        
+    if 'start_latlng' not in df.columns: 
+        df['start_latlng'] = None
 
     colunas = ['id', 'type', 'workout_type', 'name', 'distancia_km', 'Pace_Medio', 'average_heartrate', 'max_heartrate', 'Cadence_SPM', 'total_elevation_gain', 'moving_time', 'elapsed_time', 'start_date_local', 'start_latlng']
     
-    # 3. Puxa Equipamentos e Clubes do Perfil
+    # Puxando o Perfil completo
     res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
     equipamentos = {}
     clubes = []
@@ -261,11 +279,9 @@ def sync_strava(strava_id: int):
         clubes_raw = p.get("clubs", [])
         clubes = [{"nome": c.get("name"), "foto": c.get("profile")} for c in clubes_raw]
 
-    # Convertendo para dicionário JSON
     res_json = df[colunas].to_json(orient='records', force_ascii=False, date_format='iso')
     dados_formatados = json.loads(res_json)
 
-    # 4. Salva no Supabase
     supabase.table("usuarios_strava").update({
         "historico_json": dados_formatados,
         "equipamentos_json": equipamentos,
@@ -312,7 +328,6 @@ def gerar_analise_ia(payload: AnaliseIAPayload):
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         analise_json = json.loads(resposta_ia.text)
-        
         supabase.table("usuarios_strava").update({"ia_report_json": analise_json}).eq("id", payload.strava_id).execute()
         return analise_json
     except Exception as e:
@@ -336,24 +351,36 @@ def get_spotify_token():
 
 @app.get("/musica/buscar")
 def buscar_musica(q: str):
-    """Motor de busca do Jukebox."""
+    """Motor de busca do Jukebox com suporte a preview áudio."""
     token = get_spotify_token()
-    if not token: raise HTTPException(status_code=500, detail="Cofre do Spotify trancado (Chaves ausentes).")
+    if not token: 
+        raise HTTPException(status_code=500, detail="Cofre do Spotify trancado (Chaves ausentes).")
     
     headers = {"Authorization": f"Bearer {token}"}
     res = requests.get(f"https://api.spotify.com/v1/search?q={q}&type=track&limit=5", headers=headers)
     
-    if res.status_code != 200: raise HTTPException(status_code=res.status_code, detail="O Spotify recusou a busca.")
+    if res.status_code != 200: 
+        raise HTTPException(status_code=res.status_code, detail="O Spotify recusou a busca.")
     
     tracks = res.json().get("tracks", {}).get("items", [])
-    resultados = [{"id": t["id"], "nome": t["name"], "artista": t["artists"][0]["name"] if t["artists"] else "Desconhecido", "imagem": t["album"]["images"][0]["url"] if t["album"]["images"] else None} for t in tracks]
+    resultados = []
+    
+    for t in tracks:
+        resultados.append({
+            "id": t["id"],
+            "nome": t["name"],
+            "artista": t["artists"][0]["name"] if t["artists"] else "Desconhecido",
+            "imagem": t["album"]["images"][0]["url"] if t["album"]["images"] else None,
+            "preview_url": t.get("preview_url") # Trecho de 30 segundos (Se nulo, a gravadora bloqueou)
+        })
+        
     return {"resultados": resultados}
 
 @app.post("/diario/salvar")
 def salvar_diario(dados: DiarioPayload):
     """Guarda a alma da corrida na gaveta do Supabase."""
     try:
-        supabase.table("diario_treinos").upsert({
+        res = supabase.table("diario_treinos").upsert({
             "strava_id": str(dados.strava_id),
             "id_atividade_strava": dados.id_atividade_strava,
             "mood": dados.mood,
@@ -363,9 +390,13 @@ def salvar_diario(dados: DiarioPayload):
             "spotify_album_art": dados.spotify_album_art,
             "clima_snapshot": dados.clima_snapshot
         }, on_conflict="id_atividade_strava").execute()
+        
         return {"msg": "Memória guardada com sucesso!"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Falha ao escrever no diário: {str(e)}")
+        err_msg = str(e)
+        if hasattr(e, 'message'): 
+            err_msg = e.message
+        raise HTTPException(status_code=500, detail=f"Erro de Gravação no Banco de Dados: {err_msg}")
 
 # =========================================================================
 # 5. O GARIMPEIRO (MÓDULO DE TROFÉUS E RECORDES REAIS)
@@ -375,12 +406,12 @@ def formata_tempo(segundos):
     h = math.floor(segundos / 3600)
     m = math.floor((segundos % 3600) / 60)
     s = math.floor(segundos % 60)
-    if h > 0: return f"{h:02d}:{m:02d}:{s:02d}"
+    if h > 0: 
+        return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
 
 @app.post("/trofeus/garimpar/{strava_id}")
 def garimpar_trofeus(strava_id: int, payload: TrofeusPayload):
-    """Varre o histórico para achar os verdadeiros recordes pessoais (RPs)."""
     res = supabase.table("usuarios_strava").select("historico_json").eq("id", strava_id).execute()
     if not res.data or not res.data[0].get('historico_json'):
         raise HTTPException(status_code=400, detail="Histórico vazio.")
@@ -394,7 +425,6 @@ def garimpar_trofeus(strava_id: int, payload: TrofeusPayload):
     if df_runs.empty:
         return {"msg": "Nenhuma corrida/prova encontrada.", "trofeus": {}, "analisados": 0}
 
-    # Dicionário de distâncias alvo em km e suas tolerâncias (ex: 5k pode ser de 4.8 a 5.2 no GPS)
     metas = {
         '1k': (0.9, 1.1),
         '5k': (4.8, 5.3),
@@ -405,14 +435,10 @@ def garimpar_trofeus(strava_id: int, payload: TrofeusPayload):
 
     trofeus = {}
     for chave, (min_km, max_km) in metas.items():
-        # Filtra corridas que caem nessa faixa de distância
         df_faixa = df_runs[(df_runs['distancia_km'] >= min_km) & (df_runs['distancia_km'] <= max_km)].copy()
-        
         if not df_faixa.empty:
-            # Encontra a corrida com o menor tempo total (mais rápida)
             idx_best = df_faixa['moving_time'].idxmin()
             melhor_treino = df_faixa.loc[idx_best]
-            
             trofeus[chave] = {
                 "nome_treino": melhor_treino['name'],
                 "data": melhor_treino['start_date_local'],
@@ -423,9 +449,7 @@ def garimpar_trofeus(strava_id: int, payload: TrofeusPayload):
                 "fc_maxima": int(melhor_treino['max_heartrate']) if melhor_treino['max_heartrate'] else None
             }
 
-    # Salva no banco de dados para não precisar re-calcular
     supabase.table("usuarios_strava").update({"trofeus_json": trofeus}).eq("id", strava_id).execute()
-
     return {"msg": "Busca efetuada com sucesso.", "trofeus": trofeus, "analisados": len(df_runs)}
 
 # =========================================================================
@@ -434,7 +458,7 @@ def garimpar_trofeus(strava_id: int, payload: TrofeusPayload):
 
 @app.post("/fisiologia/calcular-zonas/{strava_id}")
 def calcular_zonas(strava_id: int, payload: ZonasFCPayload):
-    """Matemática Fisiológica Real (Karvonen, Friel e Clássica)."""
+    """Cálculo Matemático Real para Zonas Cardíacas."""
     zonas = []
     m = payload.metodo
 
@@ -468,40 +492,29 @@ def calcular_zonas(strava_id: int, payload: ZonasFCPayload):
             {"id": 5, "nome": "Z5 - VO2 Máx", "desc": "100-106% LTHR", "min": lthr, "max": int(lthr*1.06), "tema": "vermelho"}
         ]
     else:
-        raise HTTPException(status_code=400, detail="Parâmetros inválidos para a metodologia escolhida.")
+        raise HTTPException(status_code=400, detail="Parâmetros inválidos para a metodologia.")
 
     fisiologia_atual = {}
     res = supabase.table("usuarios_strava").select("fisiologia_json").eq("id", strava_id).execute()
     if res.data and res.data[0].get('fisiologia_json'):
         fisiologia_atual = res.data[0]['fisiologia_json']
         
-    fisiologia_atual.update({
-        "metodo": m, 
-        "fc_max": payload.fc_max, 
-        "fc_repouso": payload.fc_repouso, 
-        "fc_limiar": payload.fc_limiar,
-        "zonas": zonas
-    })
-    
+    fisiologia_atual.update({ "metodo": m, "fc_max": payload.fc_max, "fc_repouso": payload.fc_repouso, "fc_limiar": payload.fc_limiar, "zonas": zonas })
     supabase.table("usuarios_strava").update({"fisiologia_json": fisiologia_atual}).eq("id", strava_id).execute()
     return {"msg": "Zonas FC Calculadas e Salvas", "zonas": zonas, "fisiologia_salva": fisiologia_atual}
 
 @app.post("/fisiologia/salvar-zonas-pace/{strava_id}")
 def salvar_zonas_pace(strava_id: int, payload: ZonasPacePayload):
-    """Cálculo das Zonas de Ritmo (Pace) baseadas no Padrão Ouro (Jack Daniels/VDOT ou Friel)."""
+    """Cálculo das Zonas de Ritmo usando VDOT ou Friel Pace."""
     zonas_pace = []
     
     if payload.metodo == 'daniels' and payload.distancia_km and payload.tempo_segundos:
-        # Simplificação algorítmica da tabela VDOT de Jack Daniels para MVP
-        # Transforma o pace da prova no VDOT correspondente
         pace_prova_seg = payload.tempo_segundos / payload.distancia_km
-        
-        # Paces deduzidos via coeficientes clássicos de Daniels
-        pace_E = pace_prova_seg * 1.25 # Easy
-        pace_M = pace_prova_seg * 1.15 # Marathon
-        pace_T = pace_prova_seg * 1.05 # Threshold
-        pace_I = pace_prova_seg * 0.95 # Interval
-        pace_R = pace_prova_seg * 0.88 # Repetition
+        pace_E = pace_prova_seg * 1.25 
+        pace_M = pace_prova_seg * 1.15 
+        pace_T = pace_prova_seg * 1.05 
+        pace_I = pace_prova_seg * 0.95 
+        pace_R = pace_prova_seg * 0.88 
         
         zonas_pace = [
             {"id": 1, "nome": "E - Fácil", "desc": "Aquecimento / Longos", "min": formata_tempo(pace_E - 10), "max": formata_tempo(pace_E + 10), "tema": "cinza"},
@@ -511,7 +524,6 @@ def salvar_zonas_pace(strava_id: int, payload: ZonasPacePayload):
             {"id": 5, "nome": "R - Repetição", "desc": "Tiros curtos (Pista)", "min": formata_tempo(pace_R - 5), "max": formata_tempo(pace_R + 5), "tema": "vermelho"}
         ]
     elif payload.metodo == 'friel' and payload.pace_limiar:
-        # Friel's Pace Zones baseado no LTHR Pace
         try:
             m, s = map(int, payload.pace_limiar.split(':'))
             pace_lthr_seg = m * 60 + s
@@ -545,34 +557,28 @@ def salvar_zonas_pace(strava_id: int, payload: ZonasPacePayload):
 
 @app.get("/fisiologia/extrair-limiar/{strava_id}/{activity_id}")
 def extrair_limiar(strava_id: int, activity_id: int):
-    """Extrai e deduz o Limiar de Lactato (BPM) de uma atividade específica de esforço máximo."""
     res = supabase.table("usuarios_strava").select("historico_json").eq("id", strava_id).execute()
-    if not res.data: raise HTTPException(status_code=404, detail="Usuário sem histórico.")
+    if not res.data: 
+        raise HTTPException(status_code=404, detail="Usuário sem histórico.")
     
     atividades = res.data[0].get('historico_json', [])
     treino = next((t for t in atividades if t['id'] == activity_id), None)
     
-    if not treino: raise HTTPException(status_code=404, detail="Treino não encontrado no histórico.")
+    if not treino: 
+        raise HTTPException(status_code=404, detail="Treino não encontrado.")
     
     bpm_medio = treino.get('average_heartrate', 0)
-    if bpm_medio <= 0: raise HTTPException(status_code=400, detail="Este treino não possui dados cardíacos registrados.")
+    if bpm_medio <= 0: 
+        raise HTTPException(status_code=400, detail="Sem dados cardíacos na prova.")
     
-    # Motor de Dedução Simplificado: Se for 5k (aprox), foi acima do limiar (fator 0.98). 
-    # Se for 10k (aprox), foi exatamente no limiar (fator 1.00)
     fator = 1.0
     dist = treino.get('distancia_km', 0)
+    if dist < 7: 
+        fator = 0.98
+    elif dist > 15: 
+        fator = 1.05
     
-    if dist < 7: fator = 0.98
-    elif dist > 15: fator = 1.05
-    
-    limiar_estimado = int(bpm_medio * fator)
-    
-    return {
-        "limiar_estimado": limiar_estimado, 
-        "nome_prova": treino.get('name'), 
-        "bpm_medio_real": bpm_medio, 
-        "fator_correcao": fator
-    }
+    return { "limiar_estimado": int(bpm_medio * fator), "nome_prova": treino.get('name'), "bpm_medio_real": bpm_medio, "fator_correcao": fator }
 
 # =========================================================================
 # 7. MASTER COACH: IA PLANILHAS (TEXT-TO-PLAN) E CALENDÁRIO
@@ -580,9 +586,6 @@ def extrair_limiar(strava_id: int, activity_id: int):
 
 @app.get("/calendario/{strava_id}")
 def get_calendario(strava_id: int):
-    """Puxa a planilha estruturada de treinos futuros do atleta."""
-    # Como não temos uma tabela 'planilhas' configurada explicitamente no MVP atual,
-    # retornamos uma lista vazia ou guardamos no perfil do usuário no campo 'planilha_json'.
     res = supabase.table("usuarios_strava").select("planilha_json").eq("id", strava_id).execute()
     treinos = []
     if res.data and res.data[0].get('planilha_json'):
@@ -591,58 +594,34 @@ def get_calendario(strava_id: int):
 
 @app.post("/treinos/parse")
 def parse_treino(payload: ParseTreinoPayload):
-    """Usa o Gemini para ler o texto/whatsapp do treinador e converter em JSON de blocos de treino."""
     client = genai.Client(api_key=GEMINI_API_KEY)
-    
     prompt = f"""
     Transforme a seguinte mensagem do treinador num JSON estruturado para a minha aplicação.
     Mensagem: "{payload.texto_bruto}"
-    
     O JSON deve ter este exato formato:
     {{
       "descricao_limpa": "Título curto do treino",
       "distancia_estimada_km": 10.5,
       "blocos": [
-         {{
-           "tipo": "aquecimento", // Opções: aquecimento, principal, tiro, recuperacao, soltura
-           "repeticoes": 1,
-           "distancia_metros": 2000, // opcional
-           "tempo_minutos": 0, // opcional
-           "intensidade_alvo": "Z2 ou Leve"
-         }}
+         {{ "tipo": "aquecimento", "repeticoes": 1, "distancia_metros": 2000, "tempo_minutos": 0, "intensidade_alvo": "Z2 ou Leve" }}
       ]
     }}
     Não devolva Markdown. Apenas o JSON puro.
     """
-    
     try:
         resposta_ia = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
+            model='gemini-2.5-flash', contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        
         estrutura_treino = json.loads(resposta_ia.text)
+        novo_treino = { "data_treino": payload.data_treino, "texto_bruto": payload.texto_bruto, "estrutura_json": estrutura_treino }
         
-        novo_treino = {
-            "data_treino": payload.data_treino,
-            "texto_bruto": payload.texto_bruto,
-            "estrutura_json": estrutura_treino
-        }
-        
-        # Guardando o treino estruturado na tabela
         res = supabase.table("usuarios_strava").select("planilha_json").eq("id", payload.strava_id).execute()
-        planilha_atual = []
-        if res.data and res.data[0].get('planilha_json'):
-            planilha_atual = res.data[0]['planilha_json']
-            
-        # Atualiza se já existir para a data, senão adiciona
+        planilha_atual = res.data[0]['planilha_json'] if res.data and res.data[0].get('planilha_json') else []
         planilha_atual = [t for t in planilha_atual if t['data_treino'] != payload.data_treino]
         planilha_atual.append(novo_treino)
         
         supabase.table("usuarios_strava").update({"planilha_json": planilha_atual}).eq("id", payload.strava_id).execute()
-        
         return {"msg": "Treino estruturado e salvo com sucesso.", "treino": novo_treino}
-        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao interpretar o treino: {str(e)}")
