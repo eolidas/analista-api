@@ -109,7 +109,10 @@ def formatar_atividades_para_banco(lista_bruta):
     
     df['average_heartrate'] = df['average_heartrate'].fillna(0) if 'average_heartrate' in df.columns else 0
     df['max_heartrate'] = df['max_heartrate'].fillna(0) if 'max_heartrate' in df.columns else 0
-    df['Cadence_SPM'] = df['average_cadence'] * 2 if 'average_cadence' in df.columns else 0
+    
+    # SOLUÇÃO DO BUG DE CADÊNCIA: Preencher valores nulos (NaN) com zero ANTES da matemática
+    df['Cadence_SPM'] = (df['average_cadence'].fillna(0) * 2).round().astype(int) if 'average_cadence' in df.columns else 0
+    
     df['total_elevation_gain'] = df['total_elevation_gain'].fillna(0) if 'total_elevation_gain' in df.columns else 0
     
     if 'elapsed_time' not in df.columns:
