@@ -121,7 +121,7 @@ def formatar_atividades_para_banco(lista_bruta):
     if 'start_latlng' not in df.columns:
         df['start_latlng'] = None
         
-    colunas_finais = ['id', 'type', 'workout_type', 'name', 'distancia_km', 'Pace_Medio', 'average_heartrate', 'max_heartrate', 'total_elevation_gain', 'moving_time', 'start_date_local', 'elapsed_time', 'start_latlng']
+    colunas_finais = ['id', 'type', 'workout_type', 'name', 'distancia_km', 'Pace_Medio', 'average_heartrate', 'max_heartrate', 'Cadence_SPM', 'total_elevation_gain', 'moving_time', 'start_date_local', 'elapsed_time', 'start_latlng']
         
     res_json = df[colunas_finais].to_json(orient='records', force_ascii=False, date_format='iso')
     return json.loads(res_json)
