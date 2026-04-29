@@ -14,20 +14,26 @@ from google.genai import types
 
 # =========================================================================
 # ANALISTA DE BOLSO - BACKEND DE ALTA PERFORMANCE (FastAPI)
-# Arquitetura Clean Code | Versão 4.5.1 (Monolito Explícito e Descomprimido)
+# Arquitetura Clean Code | Versão 4.5.2 (Correção CORS e Health Check)
 # Motor Integrado: Strava + Supabase + Gemini 2.5 + Spotify Jukebox
 # =========================================================================
 
-app = FastAPI(title="Analista de Bolso API", version="4.5.1")
+app = FastAPI(title="Analista de Bolso API", version="4.5.2")
 
 # Configuração de CORS para permitir acesso do PWA em qualquer domínio
+# CORREÇÃO CRÍTICA: allow_credentials deve ser False quando allow_origins é ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
-    allow_credentials=True,
+    allow_credentials=False, 
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- ROTA DE HEALTH CHECK (Para evitar que o Render desative o servidor por falsos positivos) ---
+@app.get("/")
+def health_check():
+    return {"status": "Motor FastAPI Online e Operante"}
 
 # --- COFRE DE SEGURANÇA (Variáveis de Ambiente) ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
