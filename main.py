@@ -25,7 +25,7 @@ app = FastAPI(title="Analista de Bolso API", version="4.5.2")
 app.add_middleware(
     CORSMiddleware,
 app = FastAPI(title="Analista de Bolso API", version="4.5.1")
-
+)
 # Configuração de CORS para permitir acesso do PWA em qualquer domínio
 app.add_middleware(
     CORSMiddleware,
