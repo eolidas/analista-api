@@ -15,10 +15,10 @@ from google.genai import types
 # =========================================================================
 # ANALISTA DE BOLSO - BACKEND DE ALTA PERFORMANCE (FastAPI)
 # Arquitetura Clean Code | Integrações: Strava, Supabase, Gemini, Spotify
-# V4.4 - Motor de Sentimentos Duplos (Mente & Corpo)
+# V4.3 - Motor Expandido e Correções de DataFrame (FillNA Robustness)
 # =========================================================================
 
-app = FastAPI(title="Analista de Bolso API", version="4.4.0")
+app = FastAPI(title="Analista de Bolso API", version="4.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,7 +37,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
-# Inicialização do Supabase
+# Inicializando Supabase
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 except Exception as e:
@@ -75,12 +75,12 @@ class TrofeusPayload(BaseModel):
 class DiarioPayload(BaseModel):
     strava_id: str
     id_atividade_strava: int
-    mood_emocional: str = None # Novo: Estado mental
-    mood_fisico: str = None    # Novo: Condição do corpo
+    mood: str = None
     comentario: str = None
     spotify_track_id: str = None
     spotify_track_name: str = None
     spotify_album_art: str = None
+    clima_snapshot: dict = None
 
 class ParseTreinoPayload(BaseModel):
     strava_id: int
@@ -93,7 +93,7 @@ class ParseTreinoPayload(BaseModel):
 
 @app.post("/auth/strava")
 def auth_strava(req: AuthRequest):
-    """Troca o código do Strava pelos tokens e guarda o perfil no Supabase."""
+    """Troca o código do Strava pelos tokens e salva o perfil no Supabase."""
     url = "https://www.strava.com/oauth/token"
     payload = {
         'client_id': STRAVA_CLIENT_ID,
@@ -131,11 +131,10 @@ def get_atleta(strava_id: int):
     """Puxa a ficha completa do atleta (Perfil, Fisiologia, Histórico e Diários)."""
     res = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     if not res.data:
-        raise HTTPException(status_code=404, detail="Atleta não encontrado na base de dados.")
+        raise HTTPException(status_code=404, detail="Atleta não encontrado no banco.")
     
     user = res.data[0]
     
-    # Recuperação dos diários de bordo para mapeamento no frontend
     diarios_map = {}
     try:
         res_diario = supabase.table("diario_treinos").select("*").eq("strava_id", str(strava_id)).execute()
@@ -168,7 +167,7 @@ def get_atleta(strava_id: int):
 
 @app.put("/atleta/{strava_id}/biometria")
 def update_biometria(strava_id: int, dados: dict):
-    """Atualização manual de dados biométricos."""
+    """Atualiza dados biométricos manualmente."""
     supabase.table("usuarios_strava").update({
         "altura": dados.get("altura"),
         "idade": dados.get("idade"),
@@ -181,7 +180,7 @@ def update_biometria(strava_id: int, dados: dict):
 # =========================================================================
 
 def obter_token_fresco(refresh_token: str):
-    """Garante o acesso contínuo à API do Strava via refresh token."""
+    """Garante que a API tem acesso ativo ao Strava."""
     url = 'https://www.strava.com/oauth/token'
     payload = {
         'client_id': STRAVA_CLIENT_ID,
@@ -196,10 +195,10 @@ def obter_token_fresco(refresh_token: str):
 
 @app.post("/atleta/{strava_id}/sincronizar")
 def sync_strava(strava_id: int):
-    """Deep Sync: Varre o Strava e aplica lógica de limpeza de dados."""
+    """Deep Sync: Varre o Strava, aplica matemática de Pace/BPM e salva no Supabase."""
     res_user = supabase.table("usuarios_strava").select("refresh_token").eq("id", strava_id).execute()
     if not res_user.data:
-        raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
+        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
         
     access_token = obter_token_fresco(res_user.data[0]['refresh_token'])
     if not access_token:
@@ -212,41 +211,65 @@ def sync_strava(strava_id: int):
     page = 1
     while True:
         res = requests.get(url_acts, headers=headers, params={'per_page': 200, 'page': page})
-        if res.status_code != 200: break
+        if res.status_code != 200: 
+            break
         data = res.json()
-        if not data: break
+        if not data: 
+            break
         atividades.extend(data)
         page += 1
-        if page > 2: break 
+        if page > 2: 
+            break # Limite de 400 treinos para otimizar servidor free
 
     if not atividades:
         return {"historico_json": []}
 
     df = pd.DataFrame(atividades)
     df = df[df['type'].isin(['Run', 'Walk', 'Hike'])].copy()
-    if df.empty: return {"historico_json": []}
+    
+    if df.empty: 
+        return {"historico_json": []}
 
     df['distancia_km'] = df['distance'] / 1000.0
 
     def calc_pace(linha):
-        if linha['distancia_km'] == 0: return "00:00"
+        if linha['distancia_km'] == 0: 
+            return "00:00"
         pace_dec = (linha['moving_time'] / 60) / linha['distancia_km']
         return f"{int(pace_dec):02d}:{int(round((pace_dec - int(pace_dec)) * 60)):02d}"
         
     df['Pace_Medio'] = df.apply(calc_pace, axis=1)
     
-    # Tratamento de valores nulos para evitar erros de serialização JSON
-    df['average_heartrate'] = df['average_heartrate'].fillna(0) if 'average_heartrate' in df.columns else 0
-    df['max_heartrate'] = df['max_heartrate'].fillna(0) if 'max_heartrate' in df.columns else 0
-    df['Cadence_SPM'] = (df['average_cadence'].fillna(0) * 2).round().astype(int) if 'average_cadence' in df.columns else 0
-    df['total_elevation_gain'] = df['total_elevation_gain'].fillna(0) if 'total_elevation_gain' in df.columns else 0
+    # Restauração do formato estrito para evitar Data Pollution com NaNs
+    if 'average_heartrate' in df.columns:
+        df['average_heartrate'] = df['average_heartrate'].fillna(0)
+    else:
+        df['average_heartrate'] = 0
+        
+    if 'max_heartrate' in df.columns:
+        df['max_heartrate'] = df['max_heartrate'].fillna(0)
+    else:
+        df['max_heartrate'] = 0
+        
+    if 'average_cadence' in df.columns:
+        df['Cadence_SPM'] = (df['average_cadence'].fillna(0) * 2).round().astype(int)
+    else:
+        df['Cadence_SPM'] = 0
+        
+    if 'total_elevation_gain' in df.columns:
+        df['total_elevation_gain'] = df['total_elevation_gain'].fillna(0)
+    else:
+        df['total_elevation_gain'] = 0
     
-    if 'elapsed_time' not in df.columns: df['elapsed_time'] = df['moving_time']
-    if 'start_latlng' not in df.columns: df['start_latlng'] = None
+    if 'elapsed_time' not in df.columns: 
+        df['elapsed_time'] = df['moving_time']
+        
+    if 'start_latlng' not in df.columns: 
+        df['start_latlng'] = None
 
     colunas = ['id', 'type', 'workout_type', 'name', 'distancia_km', 'Pace_Medio', 'average_heartrate', 'max_heartrate', 'Cadence_SPM', 'total_elevation_gain', 'moving_time', 'elapsed_time', 'start_date_local', 'start_latlng']
     
-    # Sincronização de equipamentos e clubes
+    # Puxando o Perfil completo
     res_perfil = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
     equipamentos = {}
     clubes = []
@@ -273,9 +296,9 @@ def sync_strava(strava_id: int):
 
 @app.post("/ia/analise")
 def gerar_analise_ia(payload: AnaliseIAPayload):
-    """Consulta o Gemini 2.5 para auditoria técnica biomecânica."""
+    """Consulta o Gemini 2.5 para auditoria biomecânica de Elite."""
     res = supabase.table("usuarios_strava").select("*").eq("id", payload.strava_id).execute()
-    if not res.data: raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
+    if not res.data: raise HTTPException(status_code=404, detail="Usuário não encontrado.")
     user = res.data[0]
     historico = user.get("historico_json", [])
     
@@ -308,14 +331,14 @@ def gerar_analise_ia(payload: AnaliseIAPayload):
         supabase.table("usuarios_strava").update({"ia_report_json": analise_json}).eq("id", payload.strava_id).execute()
         return analise_json
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro no motor de IA: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro na IA: {e}")
 
 # =========================================================================
 # 4. DIÁRIO DO CORREDOR E JUKEBOX (SPOTIFY)
 # =========================================================================
 
 def get_spotify_token():
-    """Gera um token temporário para busca no catálogo do Spotify."""
+    """Gera um token temporário de acesso à API do Spotify."""
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
         return None
     auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
@@ -328,65 +351,70 @@ def get_spotify_token():
 
 @app.get("/musica/buscar")
 def buscar_musica(q: str):
-    """Motor de busca do Jukebox com suporte a preview nativo."""
+    """Motor de busca do Jukebox com suporte a preview áudio."""
     token = get_spotify_token()
-    if not token: raise HTTPException(status_code=500, detail="Credenciais do Spotify ausentes.")
+    if not token: 
+        raise HTTPException(status_code=500, detail="Cofre do Spotify trancado (Chaves ausentes).")
     
     headers = {"Authorization": f"Bearer {token}"}
     res = requests.get(f"https://api.spotify.com/v1/search?q={q}&type=track&limit=5", headers=headers)
     
-    if res.status_code != 200: raise HTTPException(status_code=res.status_code, detail="Falha na busca do Spotify.")
+    if res.status_code != 200: 
+        raise HTTPException(status_code=res.status_code, detail="O Spotify recusou a busca.")
     
     tracks = res.json().get("tracks", {}).get("items", [])
     resultados = []
+    
     for t in tracks:
         resultados.append({
             "id": t["id"],
             "nome": t["name"],
             "artista": t["artists"][0]["name"] if t["artists"] else "Desconhecido",
-            "imagem": t["album"]["images"][0]["url"] if t["album"]["images"] else None
+            "imagem": t["album"]["images"][0]["url"] if t["album"]["images"] else None,
+            "preview_url": t.get("preview_url") # Trecho de 30 segundos (Se nulo, a gravadora bloqueou)
         })
+        
     return {"resultados": resultados}
 
 @app.post("/diario/salvar")
 def salvar_diario(dados: DiarioPayload):
-    """Guarda a alma da corrida: sentimentos duplos, texto e trilha sonora."""
+    """Guarda a alma da corrida na gaveta do Supabase."""
     try:
-        # Upsert para garantir que atualizamos os sentimentos se o atleta mudar de ideia
-        supabase.table("diario_treinos").upsert({
+        res = supabase.table("diario_treinos").upsert({
             "strava_id": str(dados.strava_id),
             "id_atividade_strava": dados.id_atividade_strava,
-            "mood_emocional": dados.mood_emocional, # Novo campo: Mente
-            "mood_fisico": dados.mood_fisico,       # Novo campo: Corpo
+            "mood": dados.mood,
             "comentario": dados.comentario,
             "spotify_track_id": dados.spotify_track_id,
             "spotify_track_name": dados.spotify_track_name,
-            "spotify_album_art": dados.spotify_album_art
+            "spotify_album_art": dados.spotify_album_art,
+            "clima_snapshot": dados.clima_snapshot
         }, on_conflict="id_atividade_strava").execute()
         
-        return {"msg": "Memória selada com sucesso!"}
+        return {"msg": "Memória guardada com sucesso!"}
     except Exception as e:
         err_msg = str(e)
-        if hasattr(e, 'message'): err_msg = e.message
-        raise HTTPException(status_code=500, detail=f"Falha na escrita do diário: {err_msg}")
+        if hasattr(e, 'message'): 
+            err_msg = e.message
+        raise HTTPException(status_code=500, detail=f"Erro de Gravação no Banco de Dados: {err_msg}")
 
 # =========================================================================
-# 5. O GARIMPEIRO (MÓDULO DE TROFÉUS E RECORDES)
+# 5. O GARIMPEIRO (MÓDULO DE TROFÉUS E RECORDES REAIS)
 # =========================================================================
 
 def formata_tempo(segundos):
     h = math.floor(segundos / 3600)
     m = math.floor((segundos % 3600) / 60)
     s = math.floor(segundos % 60)
-    if h > 0: return f"{h:02d}:{m:02d}:{s:02d}"
+    if h > 0: 
+        return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
 
 @app.post("/trofeus/garimpar/{strava_id}")
 def garimpar_trofeus(strava_id: int, payload: TrofeusPayload):
-    """Varre o histórico em busca de Recordes Pessoais (RPs)."""
     res = supabase.table("usuarios_strava").select("historico_json").eq("id", strava_id).execute()
     if not res.data or not res.data[0].get('historico_json'):
-        raise HTTPException(status_code=400, detail="Histórico não disponível para análise.")
+        raise HTTPException(status_code=400, detail="Histórico vazio.")
         
     df = pd.DataFrame(res.data[0]['historico_json'])
     df_runs = df[df['type'] == 'Run'].copy()
@@ -395,7 +423,7 @@ def garimpar_trofeus(strava_id: int, payload: TrofeusPayload):
         df_runs = df_runs[df_runs['workout_type'] == 1]
         
     if df_runs.empty:
-        return {"msg": "Nenhuma corrida oficial identificada.", "trofeus": {}, "analisados": 0}
+        return {"msg": "Nenhuma corrida/prova encontrada.", "trofeus": {}, "analisados": 0}
 
     metas = {
         '1k': (0.9, 1.1),
@@ -422,15 +450,15 @@ def garimpar_trofeus(strava_id: int, payload: TrofeusPayload):
             }
 
     supabase.table("usuarios_strava").update({"trofeus_json": trofeus}).eq("id", strava_id).execute()
-    return {"msg": "Garimpagem concluída.", "trofeus": trofeus, "analisados": len(df_runs)}
+    return {"msg": "Busca efetuada com sucesso.", "trofeus": trofeus, "analisados": len(df_runs)}
 
 # =========================================================================
-# 6. MOTOR DE FISIOLOGIA (ZONAS CARDÍACAS E PACE VDOT)
+# 6. MOTOR DE FISIOLOGIA (ZONAS CARDÍACAS E RITMO - VDOT REAL)
 # =========================================================================
 
 @app.post("/fisiologia/calcular-zonas/{strava_id}")
 def calcular_zonas(strava_id: int, payload: ZonasFCPayload):
-    """Cálculos reais baseados em Karvonen, Friel e Metodologia Clássica."""
+    """Cálculo Matemático Real para Zonas Cardíacas."""
     zonas = []
     m = payload.metodo
 
@@ -464,7 +492,7 @@ def calcular_zonas(strava_id: int, payload: ZonasFCPayload):
             {"id": 5, "nome": "Z5 - VO2 Máx", "desc": "100-106% LTHR", "min": lthr, "max": int(lthr*1.06), "tema": "vermelho"}
         ]
     else:
-        raise HTTPException(status_code=400, detail="Parâmetros inválidos para calibração.")
+        raise HTTPException(status_code=400, detail="Parâmetros inválidos para a metodologia.")
 
     fisiologia_atual = {}
     res = supabase.table("usuarios_strava").select("fisiologia_json").eq("id", strava_id).execute()
@@ -473,12 +501,13 @@ def calcular_zonas(strava_id: int, payload: ZonasFCPayload):
         
     fisiologia_atual.update({ "metodo": m, "fc_max": payload.fc_max, "fc_repouso": payload.fc_repouso, "fc_limiar": payload.fc_limiar, "zonas": zonas })
     supabase.table("usuarios_strava").update({"fisiologia_json": fisiologia_atual}).eq("id", strava_id).execute()
-    return {"msg": "Zonas cardíacas moldadas.", "zonas": zonas, "fisiologia_salva": fisiologia_atual}
+    return {"msg": "Zonas FC Calculadas e Salvas", "zonas": zonas, "fisiologia_salva": fisiologia_atual}
 
 @app.post("/fisiologia/salvar-zonas-pace/{strava_id}")
 def salvar_zonas_pace(strava_id: int, payload: ZonasPacePayload):
-    """Motor VDOT para ritmos de treino científicos."""
+    """Cálculo das Zonas de Ritmo usando VDOT ou Friel Pace."""
     zonas_pace = []
+    
     if payload.metodo == 'daniels' and payload.distancia_km and payload.tempo_segundos:
         pace_prova_seg = payload.tempo_segundos / payload.distancia_km
         pace_E = pace_prova_seg * 1.25 
@@ -506,7 +535,7 @@ def salvar_zonas_pace(strava_id: int, payload: ZonasPacePayload):
                 {"id": 5, "nome": "Z5 - Anaeróbico", "desc": "Faster than 99%", "min": "00:00", "max": formata_tempo(pace_lthr_seg * 0.99), "tema": "vermelho"}
             ]
         except:
-            raise HTTPException(status_code=400, detail="Formato de Pace de Limiar inválido.")
+            raise HTTPException(status_code=400, detail="Formato de Pace de Limiar inválido (Use MM:SS).")
 
     fisiologia_atual = {}
     res = supabase.table("usuarios_strava").select("fisiologia_json").eq("id", strava_id).execute()
@@ -524,35 +553,39 @@ def salvar_zonas_pace(strava_id: int, payload: ZonasPacePayload):
     })
     
     supabase.table("usuarios_strava").update({"fisiologia_json": fisiologia_atual}).eq("id", strava_id).execute()
-    return {"msg": "Zonas de ritmo gravadas.", "zonas_pace": zonas_pace, "fisiologia_salva": fisiologia_atual}
+    return {"msg": "Zonas Pace Calculadas", "zonas_pace": zonas_pace, "fisiologia_salva": fisiologia_atual}
 
 @app.get("/fisiologia/extrair-limiar/{strava_id}/{activity_id}")
 def extrair_limiar(strava_id: int, activity_id: int):
-    """Deduz o Limiar de Lactato via telemetria de prova real."""
     res = supabase.table("usuarios_strava").select("historico_json").eq("id", strava_id).execute()
-    if not res.data: raise HTTPException(status_code=404, detail="Histórico ausente.")
+    if not res.data: 
+        raise HTTPException(status_code=404, detail="Usuário sem histórico.")
     
     atividades = res.data[0].get('historico_json', [])
     treino = next((t for t in atividades if t['id'] == activity_id), None)
-    if not treino: raise HTTPException(status_code=404, detail="Atividade não localizada.")
+    
+    if not treino: 
+        raise HTTPException(status_code=404, detail="Treino não encontrado.")
     
     bpm_medio = treino.get('average_heartrate', 0)
-    if bpm_medio <= 0: raise HTTPException(status_code=400, detail="Dados cardíacos nulos na prova.")
+    if bpm_medio <= 0: 
+        raise HTTPException(status_code=400, detail="Sem dados cardíacos na prova.")
     
     fator = 1.0
     dist = treino.get('distancia_km', 0)
-    if dist < 7: fator = 0.98
-    elif dist > 15: fator = 1.05
+    if dist < 7: 
+        fator = 0.98
+    elif dist > 15: 
+        fator = 1.05
     
     return { "limiar_estimado": int(bpm_medio * fator), "nome_prova": treino.get('name'), "bpm_medio_real": bpm_medio, "fator_correcao": fator }
 
 # =========================================================================
-# 7. MASTER COACH: IA PLANILHAS (TEXT-TO-PLAN)
+# 7. MASTER COACH: IA PLANILHAS (TEXT-TO-PLAN) E CALENDÁRIO
 # =========================================================================
 
 @app.get("/calendario/{strava_id}")
 def get_calendario(strava_id: int):
-    """Puxa o planeamento futuro da planilha inteligente."""
     res = supabase.table("usuarios_strava").select("planilha_json").eq("id", strava_id).execute()
     treinos = []
     if res.data and res.data[0].get('planilha_json'):
@@ -561,13 +594,19 @@ def get_calendario(strava_id: int):
 
 @app.post("/treinos/parse")
 def parse_treino(payload: ParseTreinoPayload):
-    """Converte linguagem natural em blocos de treino estruturados."""
     client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = f"""
-    Converta a mensagem do treinador num JSON estruturado.
+    Transforme a seguinte mensagem do treinador num JSON estruturado para a minha aplicação.
     Mensagem: "{payload.texto_bruto}"
-    Formato: {{ "descricao_limpa": "Título", "distancia_estimada_km": 10.0, "blocos": [...] }}
-    Apenas JSON limpo, sem markdown.
+    O JSON deve ter este exato formato:
+    {{
+      "descricao_limpa": "Título curto do treino",
+      "distancia_estimada_km": 10.5,
+      "blocos": [
+         {{ "tipo": "aquecimento", "repeticoes": 1, "distancia_metros": 2000, "tempo_minutos": 0, "intensidade_alvo": "Z2 ou Leve" }}
+      ]
+    }}
+    Não devolva Markdown. Apenas o JSON puro.
     """
     try:
         resposta_ia = client.models.generate_content(
@@ -583,6 +622,6 @@ def parse_treino(payload: ParseTreinoPayload):
         planilha_atual.append(novo_treino)
         
         supabase.table("usuarios_strava").update({"planilha_json": planilha_atual}).eq("id", payload.strava_id).execute()
-        return {"msg": "Treino estruturado e selado.", "treino": novo_treino}
+        return {"msg": "Treino estruturado e salvo com sucesso.", "treino": novo_treino}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"IA falhou ao interpretar o plano: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao interpretar o treino: {str(e)}")
