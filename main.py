@@ -1,19 +1,22 @@
+# Caminho: eolidas/analista-api/analista-api-ac82ff07c69bceec1f10f207740868b43fb30394/main.py
+
 import os
 import json
 import requests
+import base64
 import pandas as pd
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 5.1.0 - Módulo Master Coach (Read/Write)
+# Versão: 5.2.0 - Epic: Diário do Corredor (Spotify & Supabase)
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -21,6 +24,10 @@ STRAVA_CLIENT_SECRET = os.getenv("STRAVA_CLIENT_SECRET")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Credenciais de Integração Spotify
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -37,6 +44,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Modelos de Autenticação e Perfis ---
 class StravaAuthRequest(BaseModel):
     code: str
 
@@ -77,6 +85,15 @@ class ParseTreinoRequest(BaseModel):
     data_treino: str # Formato YYYY-MM-DD
     texto_bruto: str
     ciclo_id: Optional[str] = None
+
+# --- Diário do Corredor ---
+class DiarioTreino(BaseModel):
+    strava_id: int
+    id_atividade_strava: int
+    mood: Optional[str] = None
+    comentario: Optional[str] = None
+    dados_musica: Optional[Dict[str, Any]] = None
+    clima_snapshot: Optional[Dict[str, Any]] = None
 
 # ==========================================
 # ⚙️ FUNÇÕES DE ENGENHARIA DE DADOS E CONVERSÃO
@@ -168,12 +185,108 @@ def pace_str_to_seg(pace_str):
     return 0
 
 # ==========================================
+# 🎵 INTEGRAÇÃO SPOTIFY - DEFESA MÁXIMA
+# ==========================================
+
+def get_spotify_token() -> str:
+    """
+    Solicita o token de acesso (Client Credentials) à API do Spotify.
+    Levanta HTTPException caso as variáveis de ambiente ou a requisição falhem.
+    """
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        raise HTTPException(status_code=500, detail="Credenciais de API do Spotify não configuradas no servidor.")
+    
+    url = "https://accounts.spotify.com/api/token"
+    auth_string = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
+    b64_auth_string = base64.b64encode(auth_string.encode()).decode()
+    
+    headers = {
+        "Authorization": f"Basic {b64_auth_string}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    data = {"grant_type": "client_credentials"}
+    
+    try:
+        res = requests.post(url, headers=headers, data=data, timeout=10)
+        res.raise_for_status()
+        return res.json().get("access_token")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Falha de comunicação com a base do Spotify: {str(e)}")
+
+@app.get("/musica/buscar")
+def buscar_musica_spotify(q: str):
+    """
+    Pesquisa músicas no Spotify com base no termo fornecido e retorna array simplificado.
+    """
+    if not q:
+        raise HTTPException(status_code=400, detail="Termo de pesquisa (q) não fornecido.")
+        
+    token = get_spotify_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"https://api.spotify.com/v1/search?q={q}&type=track&limit=5"
+    
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        tracks = data.get("tracks", {}).get("items", [])
+        
+        resultados = []
+        for track in tracks:
+            # Proteção ao extrair imagem (Fallback para string vazia)
+            imagens = track.get("album", {}).get("images", [])
+            imagem_url = imagens[0].get("url", "") if imagens else ""
+            
+            # Proteção ao extrair artistas
+            artistas = track.get("artists", [])
+            artista_nome = artistas[0].get("name", "Desconhecido") if artistas else "Desconhecido"
+            
+            resultados.append({
+                "id": track.get("id"),
+                "nome": track.get("name"),
+                "artista": artista_nome,
+                "imagem_url": imagem_url
+            })
+            
+        return {"status": "success", "resultados": resultados}
+        
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar faixas no Spotify: {str(e)}")
+
+# ==========================================
+# 📝 DIÁRIO DO CORREDOR - ENDPOINTS
+# ==========================================
+
+@app.post("/diario/salvar")
+def salvar_diario_treino(req: DiarioTreino):
+    """
+    Guarda ou atualiza o Diário do Corredor associado a um treino específico no Supabase.
+    A chave primária/conflito esperada é id_atividade_strava na base diario_treinos.
+    """
+    try:
+        payload_db = {
+            "strava_id": req.strava_id,
+            "id_atividade_strava": req.id_atividade_strava,
+            "mood": req.mood,
+            "comentario": req.comentario,
+            "dados_musica": req.dados_musica,
+            "clima_snapshot": req.clima_snapshot
+        }
+        
+        # Upsert baseado em regras definidas (a tabela no Supabase deve ter a restrição/PK no id_atividade_strava)
+        res_db = supabase.table("diario_treinos").upsert(payload_db).execute()
+        return {"status": "success", "acao": "upsert_concluido", "dados": res_db.data}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha crítica de I/O ao salvar no banco (Supabase): {str(e)}")
+
+# ==========================================
 # 🌐 ROTAS DA API - OAUTH & SINCRONIZAÇÃO
 # ==========================================
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "5.1.0"}
+    return {"status": "Motor V8 Operante 🚀", "version": "5.2.0"}
 
 @app.post("/auth/strava")
 def autenticar_usuario(requisicao: StravaAuthRequest):
