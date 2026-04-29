@@ -10,8 +10,6 @@ from typing import Optional, List
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
-import base64 as _base64
-import httpx as _httpx
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
@@ -55,16 +53,16 @@ class TrofeusRequest(BaseModel):
 
 # --- Módulos Fisiológicos ---
 class ConfigZonasFC(BaseModel):
-    metodo: str
+    metodo: str  # 'max', 'karvonen', 'limiar'
     fc_max: Optional[int] = None
     fc_repouso: Optional[int] = None
     fc_limiar: Optional[int] = None
 
 class ConfigZonasPace(BaseModel):
-    metodo: str
+    metodo: str  # 'daniels', 'friel'
     distancia_km: Optional[float] = None
     tempo_segundos: Optional[int] = None
-    pace_limiar: Optional[str] = None
+    pace_limiar: Optional[str] = None # Ex: "05:00"
     altitude_m: Optional[float] = None
     temperatura_c: Optional[float] = None
 
@@ -76,20 +74,9 @@ class ExtrairLimiarMultiRequest(BaseModel):
 # --- Master Coach (Text-to-Plan) ---
 class ParseTreinoRequest(BaseModel):
     strava_id: int
-    data_treino: str
+    data_treino: str # Formato YYYY-MM-DD
     texto_bruto: str
     ciclo_id: Optional[str] = None
-
-# --- Diário do Corredor ---
-class DiarioSalvarRequest(BaseModel):
-    strava_id: int
-    id_atividade_strava: int
-    mood: Optional[str] = None
-    comentario: Optional[str] = None
-    spotify_track_id: Optional[str] = None
-    spotify_track_name: Optional[str] = None
-    spotify_album_art: Optional[str] = None
-    clima_snapshot: Optional[dict] = None
 
 # ==========================================
 # ⚙️ FUNÇÕES DE ENGENHARIA DE DADOS E CONVERSÃO
@@ -122,7 +109,10 @@ def formatar_atividades_para_banco(lista_bruta):
     
     df['average_heartrate'] = df['average_heartrate'].fillna(0) if 'average_heartrate' in df.columns else 0
     df['max_heartrate'] = df['max_heartrate'].fillna(0) if 'max_heartrate' in df.columns else 0
+    
+    # SOLUÇÃO DO BUG DE CADÊNCIA: Preencher valores nulos (NaN) com zero ANTES da matemática
     df['Cadence_SPM'] = (df['average_cadence'].fillna(0) * 2).round().astype(int) if 'average_cadence' in df.columns else 0
+    
     df['total_elevation_gain'] = df['total_elevation_gain'].fillna(0) if 'total_elevation_gain' in df.columns else 0
     
     if 'elapsed_time' not in df.columns:
@@ -278,7 +268,11 @@ def sincronizar_e_atualizar(strava_id: int):
 
 @app.get("/treinos/calendario/{strava_id}")
 def obter_calendario_treinos(strava_id: int):
+    """
+    Recupera todos os treinos planejados do atleta para montar a prancheta visual (Calendário).
+    """
     try:
+        # Busca no Supabase ordenado pela data do treino
         res_db = supabase.table("calendario_treinos").select("*").eq("strava_id", strava_id).order("data_treino").execute()
         treinos = res_db.data if res_db.data else []
         return {"status": "success", "treinos": treinos}
@@ -287,6 +281,10 @@ def obter_calendario_treinos(strava_id: int):
 
 @app.post("/treinos/parse")
 def parse_treino_texto(req: ParseTreinoRequest):
+    """
+    O Cérebro do Master Coach: Pega um texto livre do atleta e estrutura
+    via Gemini num JSON matemático rígido para o Calendário.
+    """
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         prompt = f"""
@@ -318,8 +316,10 @@ def parse_treino_texto(req: ParseTreinoRequest):
             )
         )
         
+        # Garante que a IA retornou JSON válido
         estrutura_json = json.loads(response.text)
         
+        # Upsert Inteligente (Proteção contra duplicatas no mesmo dia)
         res_busca = supabase.table("calendario_treinos").select("id").eq("strava_id", req.strava_id).eq("data_treino", req.data_treino).execute()
         
         payload_db = {
@@ -333,10 +333,12 @@ def parse_treino_texto(req: ParseTreinoRequest):
             payload_db["ciclo_id"] = req.ciclo_id
 
         if res_busca.data and len(res_busca.data) > 0:
+            # Se já havia um treino neste dia, ele atualiza (edição de treino)
             id_treino = res_busca.data[0]['id']
             supabase.table("calendario_treinos").update(payload_db).eq("id", id_treino).execute()
             acao = "atualizado"
         else:
+            # Novo agendamento
             supabase.table("calendario_treinos").insert(payload_db).execute()
             acao = "inserido"
             
@@ -484,6 +486,7 @@ def calcular_zonas_ritmo(strava_id: int, req: ConfigZonasPace):
         
         if req.metodo in ['daniels', 'friel']:
             if req.distancia_km and req.tempo_segundos:
+                
                 tempo_ajustado = req.tempo_segundos
                 if req.altitude_m and req.altitude_m > 500:
                     tempo_ajustado = tempo_ajustado * (1 - (((req.altitude_m - 500) / 1000) * 0.015))
@@ -646,112 +649,3 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
         "metodo_usado": log_relatorio.strip(),
         "qtd_analisadas": len(resultados_lthr)
     }
-
-# ==========================================
-# 🌐 ROTAS DA API - DIÁRIO DO CORREDOR
-# ==========================================
-
-async def _get_spotify_token() -> str:
-    client_id = os.environ.get("SPOTIFY_CLIENT_ID", "")
-    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
-    credentials = _base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-    async with _httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://accounts.spotify.com/api/token",
-            headers={
-                "Authorization": f"Basic {credentials}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            data={"grant_type": "client_credentials"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return resp.json()["access_token"]
-
-
-@app.get("/musica/buscar")
-async def buscar_musica(q: str):
-    try:
-        token = await _get_spotify_token()
-        async with _httpx.AsyncClient() as client:
-            resp = await client.get(
-                "https://api.spotify.com/v1/search",
-                headers={"Authorization": f"Bearer {token}"},
-                params={"q": q, "type": "track", "limit": 5},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            items = resp.json()["tracks"]["items"]
-
-        resultados = []
-        for track in items:
-            album_art = None
-            if track.get("album", {}).get("images"):
-                album_art = track["album"]["images"][0]["url"]
-            artistas = ", ".join(a["name"] for a in track.get("artists", []))
-            resultados.append({
-                "id":           track["id"],
-                "nome":         track["name"],
-                "artista":      artistas,
-                "album_art_url": album_art,
-                "preview_url":  track.get("preview_url"),  # ← LINHA ADICIONADA
-            })
-
-        return {"status": "success", "tracks": resultados}
-
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Erro ao buscar no Spotify: {str(e)}")
-
-
-@app.post("/diario/salvar")
-def salvar_diario(req: DiarioSalvarRequest):
-    try:
-        payload = {
-            "strava_id": req.strava_id,
-            "id_atividade_strava": req.id_atividade_strava,
-            "mood": req.mood,
-            "comentario": req.comentario,
-            "spotify_track_id": req.spotify_track_id,
-            "spotify_track_name": req.spotify_track_name,
-            "spotify_album_art": req.spotify_album_art,
-            "clima_snapshot": req.clima_snapshot,
-        }
-
-        existente = (
-            supabase
-            .table("diario_treinos")
-            .select("id")
-            .eq("id_atividade_strava", req.id_atividade_strava)
-            .execute()
-        )
-
-        if existente.data and len(existente.data) > 0:
-            supabase.table("diario_treinos").update(payload).eq(
-                "id_atividade_strava", req.id_atividade_strava
-            ).execute()
-            acao = "atualizado"
-        else:
-            supabase.table("diario_treinos").insert(payload).execute()
-            acao = "inserido"
-
-        return {"status": "success", "acao": acao}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao salvar diário: {str(e)}")
-
-@app.get("/diario/buscar/{strava_id}/{atividade_id}")
-def buscar_diario(strava_id: int, atividade_id: int):
-    try:
-        res = (
-            supabase
-            .table("diario_treinos")
-            .select("*")
-            .eq("strava_id", strava_id)
-            .eq("id_atividade_strava", atividade_id)
-            .execute()
-        )
-        if res.data and len(res.data) > 0:
-            return {"status": "found", "diario": res.data[0]}
-        return {"status": "not_found", "diario": None}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao buscar diário: {str(e)}")
