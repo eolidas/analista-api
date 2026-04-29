@@ -738,3 +738,20 @@ def salvar_diario(req: DiarioSalvarRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao salvar diário: {str(e)}")
+
+@app.get("/diario/buscar/{strava_id}/{atividade_id}")
+def buscar_diario(strava_id: int, atividade_id: int):
+    try:
+        res = (
+            supabase
+            .table("diario_treinos")
+            .select("*")
+            .eq("strava_id", strava_id)
+            .eq("id_atividade_strava", atividade_id)
+            .execute()
+        )
+        if res.data and len(res.data) > 0:
+            return {"status": "found", "diario": res.data[0]}
+        return {"status": "not_found", "diario": None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar diário: {str(e)}")
