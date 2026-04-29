@@ -16,7 +16,7 @@ from supabase import create_client, Client
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
-# Versão: 5.2.0 - Epic: Diário do Corredor (Spotify & Supabase)
+# Versão: 5.2.1 - Epic: Diário do Corredor (Patch Spotify & Dual Mood)
 # ==========================================
 
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
@@ -86,11 +86,12 @@ class ParseTreinoRequest(BaseModel):
     texto_bruto: str
     ciclo_id: Optional[str] = None
 
-# --- Diário do Corredor ---
+# --- Diário do Corredor (Atualizado: Dual Mood) ---
 class DiarioTreino(BaseModel):
     strava_id: int
     id_atividade_strava: int
-    mood: Optional[str] = None
+    mood_fisico: Optional[str] = None
+    mood_emocional: Optional[str] = None
     comentario: Optional[str] = None
     dados_musica: Optional[Dict[str, Any]] = None
     clima_snapshot: Optional[Dict[str, Any]] = None
@@ -267,7 +268,8 @@ def salvar_diario_treino(req: DiarioTreino):
         payload_db = {
             "strava_id": req.strava_id,
             "id_atividade_strava": req.id_atividade_strava,
-            "mood": req.mood,
+            "mood_fisico": req.mood_fisico,
+            "mood_emocional": req.mood_emocional,
             "comentario": req.comentario,
             "dados_musica": req.dados_musica,
             "clima_snapshot": req.clima_snapshot
@@ -286,7 +288,7 @@ def salvar_diario_treino(req: DiarioTreino):
 
 @app.get("/")
 def health_check():
-    return {"status": "Motor V8 Operante 🚀", "version": "5.2.0"}
+    return {"status": "Motor V8 Operante 🚀", "version": "5.2.1"}
 
 @app.post("/auth/strava")
 def autenticar_usuario(requisicao: StravaAuthRequest):
@@ -327,13 +329,35 @@ def autenticar_usuario(requisicao: StravaAuthRequest):
 
 @app.get("/atleta/{strava_id}")
 def obter_ficha_atleta(strava_id: int):
+    # 1. Busca os dados brutos do Atleta
     res_db = supabase.table("usuarios_strava").select("*").eq("id", strava_id).execute()
     if not res_db.data: raise HTTPException(status_code=404, detail="Atleta não encontrado.")
     
     atleta = res_db.data[0]
+    historico = atleta.get("historico_json") or []
+
+    # 2. Injeção Silenciosa do Diário de Treinos
+    # Prática Defensiva: Usamos Try/Except para não quebrar a ficha do atleta caso a tabela 'diario_treinos' falhe
+    try:
+        # Busca todos os diários do atleta
+        res_diarios = supabase.table("diario_treinos").select("*").eq("strava_id", strava_id).execute()
+        
+        if res_diarios.data:
+            # Cria um dicionário de busca rápida (O(1)) pelo id da atividade
+            diarios_map = {str(d["id_atividade_strava"]): d for d in res_diarios.data}
+            
+            # Percorre o histórico e injeta o objeto de diário (se existir) dentro de cada atividade
+            for atividade in historico:
+                atividade_id_str = str(atividade.get("id"))
+                if atividade_id_str in diarios_map:
+                    atividade["diario"] = diarios_map[atividade_id_str]
+                    
+    except Exception as e:
+        print(f"[Defesa] Falha ao recuperar diário_treinos (silenciada para evitar interrupção): {str(e)}")
+
     return {
         "perfil": construir_perfil_seguro(atleta),
-        "historico_json": atleta.get("historico_json") or [],
+        "historico_json": historico,
         "ia_report_json": atleta.get("ia_report_json"),
         "trofeus_json": atleta.get("trofeus_json") or {}
     }
