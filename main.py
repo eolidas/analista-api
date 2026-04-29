@@ -24,16 +24,16 @@ app = FastAPI(title="Analista de Bolso API", version="4.5.2")
 # CORREÇÃO CRÍTICA: allow_credentials deve ser False quando allow_origins é ["*"]
 app.add_middleware(
     CORSMiddleware,
+app = FastAPI(title="Analista de Bolso API", version="4.5.1")
+
+# Configuração de CORS para permitir acesso do PWA em qualquer domínio
+app.add_middleware(
+    CORSMiddleware,
     allow_origins=["*"], 
     allow_credentials=False, 
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# --- ROTA DE HEALTH CHECK (Para evitar que o Render desative o servidor por falsos positivos) ---
-@app.get("/")
-def health_check():
-    return {"status": "Motor FastAPI Online e Operante"}
 
 # --- COFRE DE SEGURANÇA (Variáveis de Ambiente) ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
