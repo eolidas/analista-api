@@ -690,12 +690,11 @@ async def buscar_musica(q: str):
                 album_art = track["album"]["images"][0]["url"]
             artistas = ", ".join(a["name"] for a in track.get("artists", []))
             resultados.append({
-                "id": track["id"],
-                "nome": track["name"],
-                "artista": artistas,
+                "id":           track["id"],
+                "nome":         track["name"],
+                "artista":      artistas,
                 "album_art_url": album_art,
-                # FIX: preview_url adicionado para reprodução de 30s no modal
-                "preview_url": track.get("preview_url"),
+                "preview_url":  track.get("preview_url"),  # ← LINHA ADICIONADA
             })
 
         return {"status": "success", "tracks": resultados}
