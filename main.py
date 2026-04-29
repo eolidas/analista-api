@@ -649,3 +649,119 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
         "metodo_usado": log_relatorio.strip(),
         "qtd_analisadas": len(resultados_lthr)
     }
+
+
+# ============================================================
+# ADIÇÃO AO FINAL DE analista-api/main.py
+# ÉPICO: O DIÁRIO DO CORREDOR — FASE 1
+# ============================================================
+
+import base64 as _base64
+import httpx as _httpx
+
+# --- Modelos Pydantic ---
+
+class DiarioSalvarRequest(BaseModel):
+    strava_id: int
+    id_atividade_strava: int
+    mood: Optional[str] = None
+    comentario: Optional[str] = None
+    spotify_track_id: Optional[str] = None
+    spotify_track_name: Optional[str] = None
+    spotify_album_art: Optional[str] = None
+    clima_snapshot: Optional[dict] = None
+
+
+# --- Helper Spotify ---
+
+async def _get_spotify_token() -> str:
+    client_id = os.environ.get("SPOTIFY_CLIENT_ID", "")
+    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+    credentials = _base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    async with _httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://accounts.spotify.com/api/token",
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={"grant_type": "client_credentials"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()["access_token"]
+
+
+# --- Endpoint 1: Busca Spotify ---
+
+@app.get("/musica/buscar")
+async def buscar_musica(q: str):
+    try:
+        token = await _get_spotify_token()
+        async with _httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://api.spotify.com/v1/search",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"q": q, "type": "track", "limit": 5},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            items = resp.json()["tracks"]["items"]
+
+        resultados = []
+        for track in items:
+            album_art = None
+            if track.get("album", {}).get("images"):
+                album_art = track["album"]["images"][0]["url"]
+            artistas = ", ".join(a["name"] for a in track.get("artists", []))
+            resultados.append({
+                "id": track["id"],
+                "nome": track["name"],
+                "artista": artistas,
+                "album_art_url": album_art,
+            })
+
+        return {"status": "success", "tracks": resultados}
+
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Erro ao buscar no Spotify: {str(e)}")
+
+
+# --- Endpoint 2: Salvar Diário ---
+
+@app.post("/diario/salvar")
+def salvar_diario(req: DiarioSalvarRequest):
+    try:
+        payload = {
+            "strava_id": req.strava_id,
+            "id_atividade_strava": req.id_atividade_strava,
+            "mood": req.mood,
+            "comentario": req.comentario,
+            "spotify_track_id": req.spotify_track_id,
+            "spotify_track_name": req.spotify_track_name,
+            "spotify_album_art": req.spotify_album_art,
+            "clima_snapshot": req.clima_snapshot,
+        }
+
+        # Verifica se já existe entrada para esta atividade
+        existente = (
+            supabase
+            .table("diario_treinos")
+            .select("id")
+            .eq("id_atividade_strava", req.id_atividade_strava)
+            .execute()
+        )
+
+        if existente.data and len(existente.data) > 0:
+            supabase.table("diario_treinos").update(payload).eq(
+                "id_atividade_strava", req.id_atividade_strava
+            ).execute()
+            acao = "atualizado"
+        else:
+            supabase.table("diario_treinos").insert(payload).execute()
+            acao = "inserido"
+
+        return {"status": "success", "acao": acao}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao salvar diário: {str(e)}")
