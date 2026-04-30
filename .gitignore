@@ -1,0 +1,29 @@
+# Environments & Secrets (CRITICAL)
+.env
+.env.*
+*.env
+.venv
+venv/
+env/
+ENV/
+
+# Python / FastAPI Caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and Databases
+*.log
+*.sqlite3
+*.db
+
+# IDEs and OS (Antigravity/VSCode)
+.vscode/
+.cursor/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

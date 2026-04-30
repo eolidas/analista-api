@@ -78,6 +78,17 @@ class ParseTreinoRequest(BaseModel):
     texto_bruto: str
     ciclo_id: Optional[str] = None
 
+# --- Diário de Treinos ---
+class DiarioCreate(BaseModel):
+    strava_id: int
+    data_diario: str
+    texto_diario: Optional[str] = None
+    mood_fisico: Optional[str] = None
+    mood_emocional: Optional[str] = None
+    spotify_track_id: Optional[str] = None
+    spotify_track_name: Optional[str] = None
+    spotify_album_art: Optional[str] = None
+
 # ==========================================
 # ⚙️ FUNÇÕES DE ENGENHARIA DE DADOS E CONVERSÃO
 # ==========================================
@@ -649,3 +660,53 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
         "metodo_usado": log_relatorio.strip(),
         "qtd_analisadas": len(resultados_lthr)
     }
+
+# ==========================================
+# 🌐 ROTAS DA API - DIÁRIO DE TREINOS
+# ==========================================
+
+@app.post("/diario")
+def salvar_diario(req: DiarioCreate):
+    try:
+        res_busca = supabase.table("diario_treinos").select("id").eq("strava_id", req.strava_id).eq("data_diario", req.data_diario).execute()
+        
+        payload_db = {
+            "strava_id": req.strava_id,
+            "data_diario": req.data_diario,
+            "texto_diario": req.texto_diario,
+            "mood_fisico": req.mood_fisico,
+            "mood_emocional": req.mood_emocional,
+            "spotify_track_id": req.spotify_track_id,
+            "spotify_track_name": req.spotify_track_name,
+            "spotify_album_art": req.spotify_album_art
+        }
+        
+        if res_busca.data and len(res_busca.data) > 0:
+            id_diario = res_busca.data[0]['id']
+            supabase.table("diario_treinos").update(payload_db).eq("id", id_diario).execute()
+            acao = "atualizado"
+        else:
+            supabase.table("diario_treinos").insert(payload_db).execute()
+            acao = "inserido"
+            
+        return {"status": "success", "acao": acao, "dados": payload_db}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Falha ao salvar diário de treino no banco de dados.")
+
+@app.get("/diario/{strava_id}")
+def obter_diarios(strava_id: int):
+    try:
+        res_db = supabase.table("diario_treinos").select("*").eq("strava_id", strava_id).order("data_diario", desc=True).execute()
+        diarios = res_db.data if res_db.data else []
+        return {"status": "success", "diarios": diarios}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Falha ao buscar diários de treino.")
+
+@app.get("/diario/{strava_id}/{data_diario}")
+def obter_diario_por_data(strava_id: int, data_diario: str):
+    try:
+        res_db = supabase.table("diario_treinos").select("*").eq("strava_id", strava_id).eq("data_diario", data_diario).execute()
+        diario = res_db.data[0] if res_db.data and len(res_db.data) > 0 else None
+        return {"status": "success", "diario": diario}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Falha ao buscar diário de treino por data.")
