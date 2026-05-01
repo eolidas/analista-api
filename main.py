@@ -37,10 +37,11 @@ app = FastAPI(title="API Analista de Bolso")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # Em produção, o ideal é listar a URL do Vercel aqui
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
 class StravaAuthRequest(BaseModel):
@@ -708,8 +709,10 @@ def salvar_diario(req: DiarioCreate):
             
         return {"status": "success", "acao": acao, "data": res.data[0] if res.data else payload_db}
     except Exception as e:
-        print(f"🔥 ERRO DIARIO_TREINOS: {str(e)}")
-        raise HTTPException(status_code=500, detail="Erro ao persistir diário no banco.")
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"❌ ERRO CRÍTICO NO POST /DIARIO:\n{error_detail}")
+        raise HTTPException(status_code=500, detail=f"Erro interno no servidor: {str(e)}")
 
 @app.get("/diario/{strava_id}")
 def obter_diarios(strava_id: int):
@@ -730,7 +733,9 @@ def obter_diario_por_atividade(strava_id: int, id_atividade: int):
             
         return {"status": "success", "diario": diario}
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Erro ao buscar diário específico.")
+        import traceback
+        print(f"❌ ERRO CRÍTICO NO GET /DIARIO/ID/ATIVIDADE:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar diário: {str(e)}")
 
 # ==========================================
 # 🎵 ROTA DO SPOTIFY
