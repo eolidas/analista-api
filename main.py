@@ -11,6 +11,9 @@ from typing import Optional, List
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
+from dotenv import load_dotenv
+
+load_dotenv() # Garante carga das variáveis de ambiente
 
 # ==========================================
 # MOTOR ANALISTA DE BOLSO - BACKEND (PRODUÇÃO)
@@ -681,7 +684,7 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
 def salvar_diario(req: DiarioCreate):
     try:
         # Busca se já existe um diário para este treino
-        res_busca = supabase.table("diario_treinos").select("id").eq("strava_id", req.strava_id).eq("id_atividade_strava", req.id_atividade_strava).execute()
+        res_busca = supabase.table("diario_treinos").select("id").eq("strava_id", str(req.strava_id)).eq("id_atividade_strava", req.id_atividade_strava).execute()
         
         payload_db = {
             "strava_id": req.strava_id,
@@ -711,7 +714,7 @@ def salvar_diario(req: DiarioCreate):
 @app.get("/diario/{strava_id}")
 def obter_diarios(strava_id: int):
     try:
-        res = supabase.table("diario_treinos").select("*").eq("strava_id", strava_id).order("data_diario", desc=True).execute()
+        res = supabase.table("diario_treinos").select("*").eq("strava_id", str(strava_id)).order("created_at", desc=True).execute()
         return {"status": "success", "diarios": res.data or []}
     except Exception as e:
         raise HTTPException(status_code=500, detail="Erro ao listar diários.")
@@ -719,7 +722,7 @@ def obter_diarios(strava_id: int):
 @app.get("/diario/{strava_id}/{id_atividade}")
 def obter_diario_por_atividade(strava_id: int, id_atividade: int):
     try:
-        res = supabase.table("diario_treinos").select("*").eq("strava_id", strava_id).eq("id_atividade_strava", id_atividade).maybe_single().execute()
+        res = supabase.table("diario_treinos").select("*").eq("strava_id", str(strava_id)).eq("id_atividade_strava", id_atividade).maybe_single().execute()
         
         diario = res.data
         if diario and "comentario" in diario:
