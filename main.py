@@ -1,6 +1,7 @@
 import os
 import json
 import requests
+import base64
 import pandas as pd
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
@@ -21,6 +22,8 @@ STRAVA_CLIENT_SECRET = os.getenv("STRAVA_CLIENT_SECRET")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -39,6 +42,7 @@ app.add_middleware(
 
 class StravaAuthRequest(BaseModel):
     code: str
+    redirect_uri: Optional[str] = None
 
 class IAAnaliseRequest(BaseModel):
     strava_id: int
@@ -81,13 +85,14 @@ class ParseTreinoRequest(BaseModel):
 # --- Diário de Treinos ---
 class DiarioCreate(BaseModel):
     strava_id: int
-    data_diario: str
-    texto_diario: Optional[str] = None
+    id_atividade_strava: int
+    comentario: Optional[str] = None
     mood_fisico: Optional[str] = None
     mood_emocional: Optional[str] = None
     spotify_track_id: Optional[str] = None
     spotify_track_name: Optional[str] = None
     spotify_album_art: Optional[str] = None
+    spotify_preview_url: Optional[str] = None
 
 # ==========================================
 # ⚙️ FUNÇÕES DE ENGENHARIA DE DADOS E CONVERSÃO
@@ -189,9 +194,16 @@ def health_check():
 @app.post("/auth/strava")
 def autenticar_usuario(requisicao: StravaAuthRequest):
     url_token = 'https://www.strava.com/oauth/token'
-    payload = {'client_id': STRAVA_CLIENT_ID, 'client_secret': STRAVA_CLIENT_SECRET, 'code': requisicao.code, 'grant_type': 'authorization_code'}
+    payload = {
+        'client_id': STRAVA_CLIENT_ID, 
+        'client_secret': STRAVA_CLIENT_SECRET, 
+        'code': requisicao.code, 
+        'grant_type': 'authorization_code'
+    }
     res = requests.post(url_token, data=payload)
-    if res.status_code != 200: raise HTTPException(status_code=400, detail="Código OAuth inválido.")
+    if res.status_code != 200: 
+        print(f"❌ Erro Strava OAuth: {res.json()}")
+        raise HTTPException(status_code=400, detail="Código OAuth inválido. Verifique se o seu Client ID/Secret estão corretos no .env do backend.")
         
     token_data = res.json()
     access_token = token_data.get('access_token')
@@ -668,45 +680,111 @@ def extrair_limiar_multi_provas(strava_id: int, req: ExtrairLimiarMultiRequest):
 @app.post("/diario")
 def salvar_diario(req: DiarioCreate):
     try:
-        res_busca = supabase.table("diario_treinos").select("id").eq("strava_id", req.strava_id).eq("data_diario", req.data_diario).execute()
+        # Busca se já existe um diário para este treino
+        res_busca = supabase.table("diario_treinos").select("id").eq("strava_id", req.strava_id).eq("id_atividade_strava", req.id_atividade_strava).execute()
         
         payload_db = {
             "strava_id": req.strava_id,
-            "data_diario": req.data_diario,
-            "texto_diario": req.texto_diario,
+            "id_atividade_strava": req.id_atividade_strava,
+            "comentario": req.comentario,
             "mood_fisico": req.mood_fisico,
             "mood_emocional": req.mood_emocional,
             "spotify_track_id": req.spotify_track_id,
             "spotify_track_name": req.spotify_track_name,
-            "spotify_album_art": req.spotify_album_art
+            "spotify_album_art": req.spotify_album_art,
+            "spotify_preview_url": req.spotify_preview_url
         }
         
         if res_busca.data and len(res_busca.data) > 0:
             id_diario = res_busca.data[0]['id']
-            supabase.table("diario_treinos").update(payload_db).eq("id", id_diario).execute()
+            res = supabase.table("diario_treinos").update(payload_db).eq("id", id_diario).execute()
             acao = "atualizado"
         else:
-            supabase.table("diario_treinos").insert(payload_db).execute()
+            res = supabase.table("diario_treinos").insert(payload_db).execute()
             acao = "inserido"
             
-        return {"status": "success", "acao": acao, "dados": payload_db}
+        return {"status": "success", "acao": acao, "data": res.data[0] if res.data else payload_db}
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Falha ao salvar diário de treino no banco de dados.")
+        print(f"🔥 ERRO DIARIO_TREINOS: {str(e)}")
+        raise HTTPException(status_code=500, detail="Erro ao persistir diário no banco.")
 
 @app.get("/diario/{strava_id}")
 def obter_diarios(strava_id: int):
     try:
-        res_db = supabase.table("diario_treinos").select("*").eq("strava_id", strava_id).order("data_diario", desc=True).execute()
-        diarios = res_db.data if res_db.data else []
-        return {"status": "success", "diarios": diarios}
+        res = supabase.table("diario_treinos").select("*").eq("strava_id", strava_id).order("data_diario", desc=True).execute()
+        return {"status": "success", "diarios": res.data or []}
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Falha ao buscar diários de treino.")
+        raise HTTPException(status_code=500, detail="Erro ao listar diários.")
 
-@app.get("/diario/{strava_id}/{data_diario}")
-def obter_diario_por_data(strava_id: int, data_diario: str):
+@app.get("/diario/{strava_id}/{id_atividade}")
+def obter_diario_por_atividade(strava_id: int, id_atividade: int):
     try:
-        res_db = supabase.table("diario_treinos").select("*").eq("strava_id", strava_id).eq("data_diario", data_diario).execute()
-        diario = res_db.data[0] if res_db.data and len(res_db.data) > 0 else None
+        res = supabase.table("diario_treinos").select("*").eq("strava_id", strava_id).eq("id_atividade_strava", id_atividade).maybe_single().execute()
+        
+        diario = res.data
+        if diario and "comentario" in diario:
+            diario["notes"] = diario.pop("comentario") # Normaliza para o frontend
+            
         return {"status": "success", "diario": diario}
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Falha ao buscar diário de treino por data.")
+        raise HTTPException(status_code=500, detail="Erro ao buscar diário específico.")
+
+# ==========================================
+# 🎵 ROTA DO SPOTIFY
+# ==========================================
+
+@app.get("/spotify/search")
+def spotify_search(q: str):
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        raise HTTPException(status_code=500, detail="Credenciais do Spotify ausentes no .env do Backend.")
+    
+    try:
+        # 1. Obter Token (Client Credentials Flow)
+        auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
+        b64_auth_str = base64.b64encode(auth_str.encode()).decode()
+        
+        token_url = "https://accounts.spotify.com/api/token"
+        token_headers = {
+            "Authorization": f"Basic {b64_auth_str}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        token_data = {"grant_type": "client_credentials"}
+        
+        res_token = requests.post(token_url, headers=token_headers, data=token_data)
+        if res_token.status_code != 200:
+            raise Exception("Falha ao obter token do Spotify")
+        
+        access_token = res_token.json().get("access_token")
+        
+        # 2. Buscar Faixas
+        search_url = "https://api.spotify.com/v1/search"
+        search_headers = {"Authorization": f"Bearer {access_token}"}
+        search_params = {"q": q, "type": "track", "limit": 4}
+        
+        res_search = requests.get(search_url, headers=search_headers, params=search_params)
+        if res_search.status_code != 200:
+            raise Exception("Falha ao pesquisar no Spotify")
+        
+        tracks = res_search.json().get("tracks", {}).get("items", [])
+        
+        resultados = []
+        for track in tracks:
+            # Pega o primeiro artista
+            artist = track.get("artists")[0].get("name") if track.get("artists") else "Artista Desconhecido"
+            
+            # Pega a capa do álbum
+            images = track.get("album", {}).get("images", [])
+            album_art = images[0].get("url") if images else None
+            
+            resultados.append({
+                "id": track.get("id"),
+                "name": track.get("name"),
+                "artist": artist,
+                "album_art": album_art,
+                "preview_url": track.get("preview_url")
+            })
+            
+        return {"status": "success", "results": resultados}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
