@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import pandas as pd
+import base64
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
