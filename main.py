@@ -1,7 +1,6 @@
 import os
 import json
 import requests
-import base64
 import pandas as pd
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
@@ -787,4 +786,4 @@ def spotify_search(q: str):
         return {"status": "success", "results": resultados}
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
